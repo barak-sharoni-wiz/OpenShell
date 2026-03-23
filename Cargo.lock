@@ -2910,6 +2910,7 @@ version = "0.0.0"
 dependencies = [
  "openshell-core",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@ pub struct OpenaiProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "openai",
     credential_env_vars: &["OPENAI_API_KEY"],
+    config_env_vars: &[],
 };
 
 impl ProviderPlugin for OpenaiProvider {

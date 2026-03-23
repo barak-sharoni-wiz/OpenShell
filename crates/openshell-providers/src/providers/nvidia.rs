@@ -10,6 +10,7 @@ pub struct NvidiaProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "nvidia",
     credential_env_vars: &["NVIDIA_API_KEY"],
+    config_env_vars: &[],
 };
 
 impl ProviderPlugin for NvidiaProvider {

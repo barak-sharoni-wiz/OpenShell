@@ -10,6 +10,7 @@ pub struct GitlabProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "gitlab",
     credential_env_vars: &["GITLAB_TOKEN", "GLAB_TOKEN", "CI_JOB_TOKEN"],
+    config_env_vars: &[],
 };
 
 impl ProviderPlugin for GitlabProvider {

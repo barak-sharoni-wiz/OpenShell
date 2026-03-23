@@ -10,6 +10,7 @@ pub struct OpencodeProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "opencode",
     credential_env_vars: &["OPENCODE_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"],
+    config_env_vars: &[],
 };
 
 impl ProviderPlugin for OpencodeProvider {

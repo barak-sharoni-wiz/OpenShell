@@ -181,15 +181,23 @@ pub async fn sync_policy(endpoint: &str, sandbox: &str, policy: &ProtoSandboxPol
     sync_policy_with_client(&mut client, sandbox, policy).await
 }
 
+/// Provider environment split into secret credentials and non-secret config.
+pub struct ProviderEnvironment {
+    /// Secret credential env vars (to be placeholdered by SecretResolver).
+    pub credentials: HashMap<String, String>,
+    /// Non-secret config env vars (injected as-is into the sandbox process).
+    pub config: HashMap<String, String>,
+}
+
 /// Fetch provider environment variables for a sandbox from OpenShell server via gRPC.
 ///
-/// Returns a map of environment variable names to values derived from provider
-/// credentials configured on the sandbox. Returns an empty map if the sandbox
-/// has no providers or the call fails.
+/// Returns separate credential and config maps derived from provider data
+/// configured on the sandbox. Credentials are later placeholdered by
+/// SecretResolver; config values bypass it and are injected as-is.
 pub async fn fetch_provider_environment(
     endpoint: &str,
     sandbox_id: &str,
-) -> Result<HashMap<String, String>> {
+) -> Result<ProviderEnvironment> {
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching provider environment");
 
     let mut client = connect(endpoint).await?;
@@ -201,7 +209,11 @@ pub async fn fetch_provider_environment(
         .await
         .into_diagnostic()?;
 
-    Ok(response.into_inner().environment)
+    let inner = response.into_inner();
+    Ok(ProviderEnvironment {
+        credentials: inner.environment,
+        config: inner.config_environment,
+    })
 }
 
 /// A reusable gRPC client for the OpenShell service.

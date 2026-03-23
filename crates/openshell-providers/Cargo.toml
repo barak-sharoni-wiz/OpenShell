@@ -13,6 +13,7 @@ repository.workspace = true
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

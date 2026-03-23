@@ -40,6 +40,9 @@ impl DiscoveredProvider {
 pub struct ProviderDiscoverySpec {
     pub id: &'static str,
     pub credential_env_vars: &'static [&'static str],
+    /// Non-secret configuration env vars that are passed through to the sandbox
+    /// as-is (bypassing the SecretResolver placeholder mechanism).
+    pub config_env_vars: &'static [&'static str],
 }
 
 pub trait ProviderPlugin: Send + Sync {

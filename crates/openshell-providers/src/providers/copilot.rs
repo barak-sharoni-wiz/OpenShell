@@ -10,6 +10,7 @@ pub struct CopilotProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "copilot",
     credential_env_vars: &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+    config_env_vars: &[],
 };
 
 impl ProviderPlugin for CopilotProvider {

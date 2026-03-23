@@ -20,6 +20,14 @@ pub fn discover_with_spec(
         }
     }
 
+    for key in spec.config_env_vars {
+        if let Some(value) = context.env_var(key)
+            && !value.trim().is_empty()
+        {
+            discovered.config.entry((*key).to_string()).or_insert(value);
+        }
+    }
+
     if discovered.is_empty() {
         Ok(None)
     } else {

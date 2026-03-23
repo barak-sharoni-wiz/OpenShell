@@ -431,8 +431,10 @@ message GetSandboxProviderEnvironmentRequest {
 
 // Get sandbox provider environment response.
 message GetSandboxProviderEnvironmentResponse {
-  // Provider credential environment variables.
+  // Provider credential environment variables (injected via SecretResolver placeholders).
   map<string, string> environment = 1;
+  // Non-secret provider configuration environment variables (injected as-is).
+  map<string, string> config_environment = 2;
 }
 
 // ---------------------------------------------------------------------------

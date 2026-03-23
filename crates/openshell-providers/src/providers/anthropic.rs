@@ -10,6 +10,7 @@ pub struct AnthropicProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "anthropic",
     credential_env_vars: &["ANTHROPIC_API_KEY"],
+    config_env_vars: &[],
 };
 
 impl ProviderPlugin for AnthropicProvider {

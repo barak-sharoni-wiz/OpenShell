@@ -10,6 +10,7 @@ pub struct CodexProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "codex",
     credential_env_vars: &["OPENAI_API_KEY"],
+    config_env_vars: &[],
 };
 
 impl ProviderPlugin for CodexProvider {

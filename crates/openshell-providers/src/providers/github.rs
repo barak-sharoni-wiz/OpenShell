@@ -10,6 +10,7 @@ pub struct GithubProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "github",
     credential_env_vars: &["GITHUB_TOKEN", "GH_TOKEN"],
+    config_env_vars: &[],
 };
 
 impl ProviderPlugin for GithubProvider {

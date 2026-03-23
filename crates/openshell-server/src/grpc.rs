@@ -915,18 +915,20 @@ impl OpenShell for OpenShellService {
             .spec
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
-        let environment =
+        let resolved =
             resolve_provider_environment(self.state.store.as_ref(), &spec.providers).await?;
 
         info!(
             sandbox_id = %sandbox_id,
             provider_count = spec.providers.len(),
-            env_count = environment.len(),
+            credential_count = resolved.credentials.len(),
+            config_count = resolved.config.len(),
             "GetSandboxProviderEnvironment request completed successfully"
         );
 
         Ok(Response::new(GetSandboxProviderEnvironmentResponse {
-            environment,
+            environment: resolved.credentials,
+            config_environment: resolved.config,
         }))
     }
 
@@ -3437,21 +3439,34 @@ fn build_remote_exec_command(req: &ExecSandboxRequest) -> String {
     }
 }
 
-/// Resolve provider credentials into environment variables.
+/// Resolved provider environment split into secret credentials and non-secret config.
+#[derive(Debug)]
+struct ResolvedProviderEnv {
+    /// Secret credential env vars (injected via SecretResolver placeholders).
+    credentials: std::collections::HashMap<String, String>,
+    /// Non-secret config env vars (injected as-is into the sandbox).
+    config: std::collections::HashMap<String, String>,
+}
+
+/// Resolve provider credentials and config into environment variables.
 ///
 /// For each provider name in the list, fetches the provider from the store and
-/// collects credential key-value pairs. Returns a map of environment variables
-/// to inject into the sandbox. When duplicate keys appear across providers, the
-/// first provider's value wins.
+/// collects credential and config key-value pairs. Returns separate maps for
+/// secrets (placeholdered by SecretResolver) and config (passed through as-is).
+/// When duplicate keys appear across providers, the first provider's value wins.
 async fn resolve_provider_environment(
     store: &crate::persistence::Store,
     provider_names: &[String],
-) -> Result<std::collections::HashMap<String, String>, Status> {
+) -> Result<ResolvedProviderEnv, Status> {
     if provider_names.is_empty() {
-        return Ok(std::collections::HashMap::new());
+        return Ok(ResolvedProviderEnv {
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+        });
     }
 
-    let mut env = std::collections::HashMap::new();
+    let mut credentials = std::collections::HashMap::new();
+    let mut config = std::collections::HashMap::new();
 
     for name in provider_names {
         let provider = store
@@ -3462,7 +3477,9 @@ async fn resolve_provider_environment(
 
         for (key, value) in &provider.credentials {
             if is_valid_env_key(key) {
-                env.entry(key.clone()).or_insert_with(|| value.clone());
+                credentials
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
             } else {
                 warn!(
                     provider_name = %name,
@@ -3471,9 +3488,24 @@ async fn resolve_provider_environment(
                 );
             }
         }
+
+        for (key, value) in &provider.config {
+            if is_valid_env_key(key) {
+                config.entry(key.clone()).or_insert_with(|| value.clone());
+            } else {
+                warn!(
+                    provider_name = %name,
+                    key = %key,
+                    "skipping config with invalid env var key"
+                );
+            }
+        }
     }
 
-    Ok(env)
+    Ok(ResolvedProviderEnv {
+        credentials,
+        config,
+    })
 }
 
 fn is_valid_env_key(key: &str) -> bool {
@@ -3830,11 +3862,15 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
 // Provider CRUD
 // ---------------------------------------------------------------------------
 
-/// Strip credential values from a provider before returning it in a gRPC
-/// response.  Internal server paths (inference routing, sandbox env injection)
-/// read credentials from the store directly and are unaffected.
+/// Replace credential values with a redaction marker before returning in a
+/// gRPC response.  Key names are preserved so clients can display which
+/// credentials are configured.  Internal server paths (inference routing,
+/// sandbox env injection) read credentials from the store directly and are
+/// unaffected.
 fn redact_provider_credentials(mut provider: Provider) -> Provider {
-    provider.credentials.clear();
+    for value in provider.credentials.values_mut() {
+        *value = "***".to_string();
+    }
     provider
 }
 
@@ -3848,9 +3884,9 @@ async fn create_provider_record(
     if provider.r#type.trim().is_empty() {
         return Err(Status::invalid_argument("provider.type is required"));
     }
-    if provider.credentials.is_empty() {
+    if provider.credentials.is_empty() && provider.config.is_empty() {
         return Err(Status::invalid_argument(
-            "provider.credentials must not be empty",
+            "provider must have at least one credential or config entry",
         ));
     }
 
@@ -4134,11 +4170,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(updated.id, provider_id);
-        // Credentials are redacted in responses.
+        // Credential values are redacted in responses but key names are preserved.
         assert!(
-            updated.credentials.is_empty(),
-            "credentials must be redacted in gRPC responses"
+            updated.credentials.values().all(|v| v == "***"),
+            "credential values must be redacted in gRPC responses"
         );
+        assert!(updated.credentials.contains_key("API_TOKEN"));
         // Verify the store still has full credentials.
         let stored: Provider = store
             .get_message_by_name("gitlab-local")
@@ -4243,8 +4280,8 @@ mod tests {
 
         assert_eq!(updated.id, persisted.id);
         assert_eq!(updated.r#type, "nvidia");
-        // Credentials are redacted in responses.
-        assert!(updated.credentials.is_empty());
+        // Credential values are redacted but key names are preserved.
+        assert!(updated.credentials.values().all(|v| v == "***"));
         assert_eq!(updated.config.len(), 2);
         assert_eq!(
             updated.config.get("endpoint"),
@@ -4283,8 +4320,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Credentials are redacted in responses.
-        assert!(updated.credentials.is_empty());
+        // Credential values are redacted but key names are preserved.
+        assert_eq!(updated.credentials.len(), 1);
+        assert_eq!(updated.credentials.get("API_TOKEN"), Some(&"***".to_string()));
         assert_eq!(updated.config.len(), 1);
         assert_eq!(
             updated.config.get("endpoint"),
@@ -4387,7 +4425,8 @@ mod tests {
     async fn resolve_provider_env_empty_list_returns_empty() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         let result = resolve_provider_environment(&store, &[]).await.unwrap();
-        assert!(result.is_empty());
+        assert!(result.credentials.is_empty());
+        assert!(result.config.is_empty());
     }
 
     #[tokio::test]
@@ -4414,10 +4453,19 @@ mod tests {
         let result = resolve_provider_environment(&store, &["claude-local".to_string()])
             .await
             .unwrap();
-        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
-        assert_eq!(result.get("CLAUDE_API_KEY"), Some(&"sk-abc".to_string()));
-        // Config values should NOT be injected.
-        assert!(!result.contains_key("endpoint"));
+        assert_eq!(
+            result.credentials.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-abc".to_string())
+        );
+        assert_eq!(
+            result.credentials.get("CLAUDE_API_KEY"),
+            Some(&"sk-abc".to_string())
+        );
+        // Config values go into config_environment, not credentials.
+        assert_eq!(
+            result.config.get("endpoint"),
+            Some(&"https://api.anthropic.com".to_string())
+        );
     }
 
     #[tokio::test]
@@ -4451,9 +4499,12 @@ mod tests {
         let result = resolve_provider_environment(&store, &["test-provider".to_string()])
             .await
             .unwrap();
-        assert_eq!(result.get("VALID_KEY"), Some(&"value".to_string()));
-        assert!(!result.contains_key("nested.api_key"));
-        assert!(!result.contains_key("bad-key"));
+        assert_eq!(
+            result.credentials.get("VALID_KEY"),
+            Some(&"value".to_string())
+        );
+        assert!(!result.credentials.contains_key("nested.api_key"));
+        assert!(!result.credentials.contains_key("bad-key"));
     }
 
     #[tokio::test]
@@ -4495,8 +4546,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
-        assert_eq!(result.get("GITLAB_TOKEN"), Some(&"glpat-xyz".to_string()));
+        assert_eq!(
+            result.credentials.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-abc".to_string())
+        );
+        assert_eq!(
+            result.credentials.get("GITLAB_TOKEN"),
+            Some(&"glpat-xyz".to_string())
+        );
     }
 
     #[tokio::test]
@@ -4538,7 +4595,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.get("SHARED_KEY"), Some(&"first-value".to_string()));
+        assert_eq!(
+            result.credentials.get("SHARED_KEY"),
+            Some(&"first-value".to_string())
+        );
     }
 
     /// Simulates the handler flow: persist a sandbox with providers, then resolve
@@ -4593,7 +4653,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&"sk-test".to_string()));
+        assert_eq!(
+            env.credentials.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-test".to_string())
+        );
     }
 
     /// Handler flow returns empty map when sandbox has no providers.
@@ -4624,7 +4687,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(env.is_empty());
+        assert!(env.credentials.is_empty());
+        assert!(env.config.is_empty());
     }
 
     /// Handler returns not-found when sandbox doesn't exist.

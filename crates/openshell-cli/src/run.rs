@@ -3202,10 +3202,11 @@ pub async fn provider_create(
         }
     }
 
-    if credential_map.is_empty() {
+    if credential_map.is_empty() && config_map.is_empty() {
         return Err(miette::miette!(
-            "no credentials resolved for provider type '{provider_type}'. \
-             Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
+            "no credentials or config resolved for provider type '{provider_type}'. \
+             Use --credential KEY[=VALUE], --config KEY[=VALUE], or --from-existing \
+             with the appropriate env vars set."
         ));
     }
 

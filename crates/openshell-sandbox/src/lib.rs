@@ -187,22 +187,55 @@ pub async fn run_sandbox(
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+    let fetched_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
         match grpc_client::fetch_provider_environment(endpoint, id).await {
             Ok(env) => {
-                info!(env_count = env.len(), "Fetched provider environment");
+                info!(
+                    credential_count = env.credentials.len(),
+                    config_count = env.config.len(),
+                    "Fetched provider environment"
+                );
                 env
             }
             Err(e) => {
                 warn!(error = %e, "Failed to fetch provider environment, continuing without");
-                std::collections::HashMap::new()
+                grpc_client::ProviderEnvironment {
+                    credentials: std::collections::HashMap::new(),
+                    config: std::collections::HashMap::new(),
+                }
             }
         }
     } else {
-        std::collections::HashMap::new()
+        grpc_client::ProviderEnvironment {
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+        }
     };
 
-    let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
+    // Materialise GCP service-account credentials to a file on disk so that
+    // GOOGLE_APPLICATION_CREDENTIALS can point to a real path inside the sandbox.
+    // This must happen before SecretResolver consumes the credentials map.
+    let mut fetched_env = fetched_env;
+    if let Some(creds_json) = fetched_env
+        .credentials
+        .remove("GOOGLE_APPLICATION_CREDENTIALS_DATA")
+    {
+        let creds_path = "/tmp/gcp-credentials.json";
+        std::fs::write(creds_path, &creds_json).into_diagnostic()?;
+        info!(path = creds_path, "Materialised GCP credentials file");
+        fetched_env.config.insert(
+            "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+            creds_path.to_string(),
+        );
+    }
+
+    // Credentials go through SecretResolver (placeholdered, rewritten in HTTP headers).
+    // Config env vars bypass it and are injected as-is into the process.
+    let (mut provider_env, secret_resolver) =
+        SecretResolver::from_provider_env(fetched_env.credentials);
+    for (key, value) in fetched_env.config {
+        provider_env.entry(key).or_insert(value);
+    }
     let secret_resolver = secret_resolver.map(Arc::new);
 
     // Create identity cache for SHA256 TOFU when OPA is active
