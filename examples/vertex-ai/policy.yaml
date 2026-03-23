@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Sandbox policy for running Claude Code with Vertex AI.
+# Extends the default Claude Code endpoints with Google Cloud APIs
+# required for Vertex AI authentication and inference.
+#
+# Usage:
+#   openshell sandbox create -- claude
+#   openshell policy set <sandbox-name> --policy examples/vertex-ai/policy.yaml
+#
+# Or set as default for all new sandboxes:
+#   export OPENSHELL_SANDBOX_POLICY=examples/vertex-ai/policy.yaml
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /app
+    - /etc
+    - /var/log
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  claude_code:
+    name: claude-code-vertex
+    endpoints:
+      # Standard Claude Code endpoints
+      - { host: api.anthropic.com, port: 443 }
+      - { host: statsig.anthropic.com, port: 443 }
+      # Google Cloud / Vertex AI endpoints
+      - { host: "*.googleapis.com", port: 443 }
+      - { host: oauth2.googleapis.com, port: 443 }
+      - { host: "*.aiplatform.googleapis.com", port: 443 }
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/node }
