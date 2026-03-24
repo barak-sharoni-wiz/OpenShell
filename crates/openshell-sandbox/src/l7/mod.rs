@@ -31,14 +31,16 @@ impl L7Protocol {
     }
 }
 
-/// TLS handling mode for L7-inspected endpoints.
+/// TLS handling mode for proxy connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlsMode {
-    /// No TLS termination — L7 inspection on plaintext only.
+    /// Auto-detect TLS by peeking the first bytes. If TLS is detected,
+    /// terminate it transparently. This is the default for all endpoints.
     #[default]
-    Passthrough,
-    /// Proxy terminates TLS, inspects plaintext, re-encrypts to upstream.
-    Terminate,
+    Auto,
+    /// Explicit opt-out: raw tunnel with no TLS termination and no credential
+    /// injection. Use for client-cert mTLS to upstream or non-standard protocols.
+    Skip,
 }
 
 /// Enforcement mode for L7 policy decisions.
@@ -85,8 +87,22 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let protocol = L7Protocol::parse(&protocol_val)?;
 
     let tls = match get_object_str(val, "tls").as_deref() {
-        Some("terminate") => TlsMode::Terminate,
-        _ => TlsMode::Passthrough,
+        Some("skip") => TlsMode::Skip,
+        Some("terminate") => {
+            tracing::warn!(
+                "'tls: terminate' is deprecated; TLS termination is now automatic. \
+                 Use 'tls: skip' to explicitly disable. This field will be removed in a future version."
+            );
+            TlsMode::Auto
+        }
+        Some("passthrough") => {
+            tracing::warn!(
+                "'tls: passthrough' is deprecated; TLS termination is now automatic. \
+                 Use 'tls: skip' to explicitly disable. This field will be removed in a future version."
+            );
+            TlsMode::Auto
+        }
+        _ => TlsMode::Auto,
     };
 
     let enforcement = match get_object_str(val, "enforcement").as_deref() {
@@ -99,6 +115,18 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         tls,
         enforcement,
     })
+}
+
+/// Parse the `tls` field from an endpoint config, independent of L7 protocol.
+///
+/// Used to check for `tls: skip` even on L4-only endpoints (no `protocol`
+/// field) that explicitly opt out of TLS auto-detection.
+pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
+    match get_object_str(val, "tls").as_deref() {
+        Some("skip") => TlsMode::Skip,
+        Some("terminate") | Some("passthrough") => TlsMode::Auto, // deprecation logged by parse_l7_config
+        _ => TlsMode::Auto,
+    }
 }
 
 /// Extract a string value from a regorus object.
@@ -209,10 +237,17 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 ));
             }
 
-            // tls: terminate requires protocol
-            if tls == "terminate" && protocol.is_empty() {
-                errors.push(format!(
-                    "{loc}: TLS termination requires a protocol for L7 inspection"
+            // Deprecated tls values: warn but don't error
+            if tls == "terminate" || tls == "passthrough" {
+                warnings.push(format!(
+                    "{loc}: 'tls: {tls}' is deprecated; TLS termination is now automatic. Use 'tls: skip' to disable."
+                ));
+            }
+
+            // tls: skip with L7 on port 443 won't work
+            if tls == "skip" && !protocol.is_empty() && ports.contains(&443) {
+                warnings.push(format!(
+                    "{loc}: 'tls: skip' with L7 rules on port 443 — L7 inspection cannot work on encrypted traffic"
                 ));
             }
 
@@ -234,12 +269,9 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 ));
             }
 
-            // port 443 + rest + no tls: terminate
-            if protocol == "rest" && ports.contains(&443) && tls != "terminate" {
-                warnings.push(format!(
-                    "{loc}: L7 rules won't be evaluated on encrypted traffic without `tls: terminate`"
-                ));
-            }
+            // port 443 + rest + tls: skip — L7 won't work (already handled above)
+            // The old warning about missing `tls: terminate` is no longer needed
+            // because TLS termination is now automatic.
 
             // Validate HTTP methods in rules
             if has_rules && protocol == "rest" {
@@ -350,7 +382,8 @@ mod tests {
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert_eq!(config.protocol, L7Protocol::Rest);
-        assert_eq!(config.tls, TlsMode::Terminate);
+        // "terminate" is deprecated and treated as Auto.
+        assert_eq!(config.tls, TlsMode::Auto);
         assert_eq!(config.enforcement, EnforcementMode::Enforce);
     }
 
@@ -362,8 +395,18 @@ mod tests {
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert_eq!(config.protocol, L7Protocol::Rest);
-        assert_eq!(config.tls, TlsMode::Passthrough);
+        assert_eq!(config.tls, TlsMode::Auto);
         assert_eq!(config.enforcement, EnforcementMode::Audit);
+    }
+
+    #[test]
+    fn parse_l7_config_skip() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "tls": "skip", "host": "api.example.com", "port": 443}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(config.tls, TlsMode::Skip);
     }
 
     #[test]
@@ -436,29 +479,59 @@ mod tests {
     }
 
     #[test]
-    fn validate_tls_terminate_requires_protocol() {
+    fn validate_tls_terminate_deprecated_warning() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
                     "endpoints": [{
                         "host": "api.example.com",
                         "port": 443,
-                        "tls": "terminate"
+                        "tls": "terminate",
+                        "protocol": "rest",
+                        "access": "full"
                     }],
                     "binaries": []
                 }
             }
         });
-        let (errors, _warnings) = validate_l7_policies(&data);
+        let (errors, warnings) = validate_l7_policies(&data);
         assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("TLS termination requires"))
+            errors.is_empty(),
+            "deprecated tls should not error: {errors:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("deprecated")),
+            "should warn about deprecated tls: {warnings:?}"
         );
     }
 
     #[test]
-    fn validate_port_443_rest_no_tls_warns() {
+    fn validate_tls_skip_with_l7_on_443_warns() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "tls": "skip",
+                        "protocol": "rest",
+                        "access": "read-only"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (_errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            warnings.iter().any(|w| w.contains("tls: skip")),
+            "should warn about skip + L7 on 443: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_port_443_rest_no_tls_no_warning() {
+        // With auto-TLS, no warning is needed for port 443 + rest without
+        // explicit tls field — TLS will be auto-detected.
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
@@ -472,8 +545,12 @@ mod tests {
                 }
             }
         });
-        let (_errors, warnings) = validate_l7_policies(&data);
-        assert!(warnings.iter().any(|w| w.contains("tls: terminate")));
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(errors.is_empty(), "should have no errors: {errors:?}");
+        assert!(
+            !warnings.iter().any(|w| w.contains("tls")),
+            "should have no tls warnings with auto-detect: {warnings:?}"
+        );
     }
 
     #[test]
@@ -681,7 +758,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_ports_array_rest_443_warns() {
+    fn validate_ports_array_rest_443_no_warning() {
+        // With auto-TLS, no warning needed for ports array containing 443.
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
@@ -695,10 +773,11 @@ mod tests {
                 }
             }
         });
-        let (_errors, warnings) = validate_l7_policies(&data);
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(errors.is_empty(), "should have no errors: {errors:?}");
         assert!(
-            warnings.iter().any(|w| w.contains("tls: terminate")),
-            "REST on port 443 without tls:terminate should warn, got warnings: {warnings:?}"
+            !warnings.iter().any(|w| w.contains("tls")),
+            "should have no tls warnings with auto-detect: {warnings:?}"
         );
     }
 }
