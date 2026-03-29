@@ -418,7 +418,12 @@ async fn handle_tcp_connection(
     // Query allowed_ips from the matched endpoint config (if any).
     // When present, the SSRF check validates resolved IPs against this
     // allowlist instead of blanket-blocking all private IPs.
-    let raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
+    // When the policy host is already a literal IP address, treat it as
+    // implicitly allowed — the user explicitly declared the destination.
+    let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
+    if raw_allowed_ips.is_empty() {
+        raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
+    }
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
     let mut upstream = if !raw_allowed_ips.is_empty() {
@@ -523,110 +528,131 @@ async fn handle_tcp_connection(
         engine = "opa",
         policy = %policy_str,
         reason = "",
-        connect_msg,
+        "{connect_msg}",
     );
 
-    if let Some(l7_config) = l7_config {
-        // Clone engine for per-tunnel L7 evaluation (cheap: shares compiled policy via Arc)
-        let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
-            warn!(error = %e, "Failed to clone OPA engine for L7, falling back to L4-only");
-            // This shouldn't happen, but if it does fall through to copy_bidirectional
-            regorus::Engine::new()
-        });
+    // Determine effective TLS mode. Check the raw endpoint config for
+    // `tls: skip` independently of L7 config (which requires `protocol`).
+    let effective_tls_skip =
+        query_tls_mode(&opa_engine, &decision, &host_lc, port) == crate::l7::TlsMode::Skip;
 
-        let ctx = crate::l7::relay::L7EvalContext {
-            host: host_lc.clone(),
-            port,
-            policy_name: matched_policy.clone().unwrap_or_default(),
-            binary_path: decision
-                .binary
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            ancestors: decision
-                .ancestors
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-            cmdline_paths: decision
-                .cmdline_paths
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-            secret_resolver: secret_resolver.clone(),
-        };
+    // Build L7 eval context (shared by TLS-terminated and plaintext paths).
+    let ctx = crate::l7::relay::L7EvalContext {
+        host: host_lc.clone(),
+        port,
+        policy_name: matched_policy.clone().unwrap_or_default(),
+        binary_path: decision
+            .binary
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        ancestors: decision
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        cmdline_paths: decision
+            .cmdline_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        secret_resolver: secret_resolver.clone(),
+    };
 
-        if l7_config.tls == crate::l7::TlsMode::Terminate {
-            // TLS termination: MITM decrypt, inspect, re-encrypt
-            if let Some(ref tls) = tls_state {
-                let l7_result = async {
-                    let mut tls_client =
-                        crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
-                    let mut tls_upstream = crate::l7::tls::tls_connect_upstream(
-                        upstream,
-                        &host_lc,
-                        tls.upstream_config(),
-                    )
-                    .await?;
-                    // No protocol detection needed — ALPN proves HTTP
+    if effective_tls_skip {
+        // tls: skip — raw tunnel, no termination, no credential injection.
+        debug!(
+            host = %host_lc,
+            port = port,
+            "tls: skip — bypassing TLS auto-detection, raw tunnel"
+        );
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
+            .await
+            .into_diagnostic()?;
+        return Ok(());
+    }
+
+    // Auto-detect TLS by peeking the first bytes.
+    let mut peek_buf = [0u8; 8];
+    let n = client.peek(&mut peek_buf).await.into_diagnostic()?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let is_tls = crate::l7::tls::looks_like_tls(&peek_buf[..n]);
+    let is_http = crate::l7::rest::looks_like_http(&peek_buf[..n]);
+
+    if is_tls {
+        // TLS detected — terminate unconditionally.
+        if let Some(ref tls) = tls_state {
+            let tls_result = async {
+                let mut tls_client =
+                    crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
+                let mut tls_upstream =
+                    crate::l7::tls::tls_connect_upstream(upstream, &host_lc, tls.upstream_config())
+                        .await?;
+
+                if let Some(ref l7_config) = l7_config {
+                    // L7 inspection on terminated TLS traffic.
+                    let tunnel_engine =
+                        opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+                            warn!(error = %e, "Failed to clone OPA engine for L7, falling back to relay-only");
+                            regorus::Engine::new()
+                        });
                     crate::l7::relay::relay_with_inspection(
-                        &l7_config,
+                        l7_config,
                         std::sync::Mutex::new(tunnel_engine),
                         &mut tls_client,
                         &mut tls_upstream,
                         &ctx,
                     )
                     .await
-                };
-                if let Err(e) = l7_result.await {
-                    if is_benign_relay_error(&e) {
-                        debug!(
-                            host = %host_lc,
-                            port = port,
-                            error = %e,
-                            "TLS L7 connection closed"
-                        );
-                    } else {
-                        warn!(
-                            host = %host_lc,
-                            port = port,
-                            error = %e,
-                            "TLS L7 relay error"
-                        );
-                    }
-                }
-            } else {
-                warn!(
-                    host = %host_lc,
-                    port = port,
-                    "TLS termination requested but TLS state not configured, falling back to L4"
-                );
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                } else {
+                    // No L7 config — relay with credential injection only.
+                    crate::l7::relay::relay_passthrough_with_credentials(
+                        &mut tls_client,
+                        &mut tls_upstream,
+                        &ctx,
+                    )
                     .await
-                    .into_diagnostic()?;
-            }
-        } else {
-            // Plaintext: protocol detection via peek on raw TcpStream
-            if l7_config.protocol == crate::l7::L7Protocol::Rest {
-                let mut peek_buf = [0u8; 8];
-                let n = client.peek(&mut peek_buf).await.into_diagnostic()?;
-                if n == 0 {
-                    return Ok(());
                 }
-                if !crate::l7::rest::looks_like_http(&peek_buf[..n]) {
+            };
+            if let Err(e) = tls_result.await {
+                if is_benign_relay_error(&e) {
+                    debug!(
+                        host = %host_lc,
+                        port = port,
+                        error = %e,
+                        "TLS connection closed"
+                    );
+                } else {
                     warn!(
                         host = %host_lc,
                         port = port,
-                        policy = %ctx.policy_name,
-                        "Expected REST protocol but received non-matching bytes. Connection rejected."
+                        error = %e,
+                        "TLS relay error"
                     );
-                    return Err(miette::miette!(
-                        "Protocol mismatch: expected HTTP but received non-HTTP bytes"
-                    ));
                 }
             }
+        } else {
+            warn!(
+                host = %host_lc,
+                port = port,
+                "TLS detected but TLS state not configured, falling back to raw tunnel"
+            );
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await
+                .into_diagnostic()?;
+        }
+    } else if is_http {
+        // Plaintext HTTP detected.
+        if let Some(ref l7_config) = l7_config {
+            let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+                warn!(error = %e, "Failed to clone OPA engine for L7, falling back to relay-only");
+                regorus::Engine::new()
+            });
             if let Err(e) = crate::l7::relay::relay_with_inspection(
-                &l7_config,
+                l7_config,
                 std::sync::Mutex::new(tunnel_engine),
                 &mut client,
                 &mut upstream,
@@ -635,29 +661,38 @@ async fn handle_tcp_connection(
             .await
             {
                 if is_benign_relay_error(&e) {
-                    debug!(
-                        host = %host_lc,
-                        port = port,
-                        error = %e,
-                        "L7 connection closed"
-                    );
+                    debug!(host = %host_lc, port = port, error = %e, "L7 connection closed");
                 } else {
-                    warn!(
-                        host = %host_lc,
-                        port = port,
-                        error = %e,
-                        "L7 relay error"
-                    );
+                    warn!(host = %host_lc, port = port, error = %e, "L7 relay error");
+                }
+            }
+        } else {
+            // Plaintext HTTP, no L7 config — relay with credential injection.
+            if let Err(e) = crate::l7::relay::relay_passthrough_with_credentials(
+                &mut client,
+                &mut upstream,
+                &ctx,
+            )
+            .await
+            {
+                if is_benign_relay_error(&e) {
+                    debug!(host = %host_lc, port = port, error = %e, "HTTP relay closed");
+                } else {
+                    warn!(host = %host_lc, port = port, error = %e, "HTTP relay error");
                 }
             }
         }
-        return Ok(());
+    } else {
+        // Neither TLS nor HTTP — raw binary relay.
+        debug!(
+            host = %host_lc,
+            port = port,
+            "Non-TLS non-HTTP traffic detected, raw tunnel"
+        );
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
+            .await
+            .into_diagnostic()?;
     }
-
-    // L4-only: raw bidirectional copy (existing behavior)
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
-        .await
-        .into_diagnostic()?;
 
     Ok(())
 }
@@ -1034,19 +1069,23 @@ async fn route_inference_request(
     }
 }
 
+/// Map router errors to HTTP status codes and sanitized messages.
+///
+/// Returns generic error messages instead of verbatim internal details.
+/// Full error context (upstream URLs, hostnames, TLS details) is logged
+/// server-side by the caller at `warn` level for debugging.
 fn router_error_to_http(err: &openshell_router::RouterError) -> (u16, String) {
     use openshell_router::RouterError;
     match err {
-        RouterError::RouteNotFound(hint) => {
-            (400, format!("no route configured for route '{hint}'"))
+        RouterError::RouteNotFound(_) => (400, "no inference route configured".to_string()),
+        RouterError::NoCompatibleRoute(_) => {
+            (400, "no compatible inference route available".to_string())
         }
-        RouterError::NoCompatibleRoute(protocol) => (
-            400,
-            format!("no compatible route for source protocol '{protocol}'"),
-        ),
-        RouterError::Unauthorized(msg) => (401, msg.clone()),
-        RouterError::UpstreamUnavailable(msg) => (503, msg.clone()),
-        RouterError::UpstreamProtocol(msg) | RouterError::Internal(msg) => (502, msg.clone()),
+        RouterError::Unauthorized(_) => (401, "unauthorized".to_string()),
+        RouterError::UpstreamUnavailable(_) => (503, "inference service unavailable".to_string()),
+        RouterError::UpstreamProtocol(_) | RouterError::Internal(_) => {
+            (502, "inference service error".to_string())
+        }
     }
 }
 
@@ -1139,18 +1178,52 @@ fn query_l7_config(
     }
 }
 
-/// Check if an IP address is internal (loopback, private RFC1918, or link-local).
+/// Query the TLS mode for an endpoint, independent of L7 config.
+///
+/// This extracts `tls: skip` from the endpoint even when no `protocol` is set.
+fn query_tls_mode(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+) -> crate::l7::TlsMode {
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        _ => false,
+    };
+    if !has_policy {
+        return crate::l7::TlsMode::Auto;
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_endpoint_config(&input) {
+        Ok(Some(val)) => crate::l7::parse_tls_mode(&val),
+        _ => crate::l7::TlsMode::Auto,
+    }
+}
+
+/// Check if an IP address is internal (loopback, private RFC1918, link-local, or unspecified).
 ///
 /// This is a defense-in-depth check to prevent SSRF via the CONNECT proxy.
 /// It covers:
-/// - IPv4 loopback (127.0.0.0/8), private (10/8, 172.16/12, 192.168/16), link-local (169.254/16)
-/// - IPv6 loopback (`::1`), link-local (`fe80::/10`), ULA (`fc00::/7`)
+/// - IPv4 loopback (127.0.0.0/8), private (10/8, 172.16/12, 192.168/16), link-local (169.254/16), unspecified (`0.0.0.0`)
+/// - IPv6 loopback (`::1`), link-local (`fe80::/10`), ULA (`fc00::/7`), unspecified (`::`)
 /// - IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) are unwrapped and checked as IPv4
 fn is_internal_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
         IpAddr::V6(v6) => {
-            if v6.is_loopback() {
+            if v6.is_loopback() || v6.is_unspecified() {
                 return true;
             }
             // fe80::/10 — IPv6 link-local
@@ -1163,10 +1236,26 @@ fn is_internal_ip(ip: IpAddr) -> bool {
             }
             // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback() || v4.is_private() || v4.is_link_local();
+                return v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified();
             }
             false
         }
+    }
+}
+
+/// When the policy endpoint host is a literal IP address, the user has
+/// explicitly declared intent to allow that destination.  Synthesize an
+/// `allowed_ips` entry so the existing allowlist-validation path is used
+/// instead of the blanket internal-IP rejection.  Loopback and link-local
+/// addresses are still blocked by `resolve_and_check_allowed_ips`.
+fn implicit_allowed_ips_for_ip_host(host: &str) -> Vec<String> {
+    if host.parse::<IpAddr>().is_ok() {
+        vec![host.to_string()]
+    } else {
+        vec![]
     }
 }
 
@@ -1203,14 +1292,14 @@ async fn resolve_and_reject_internal(
 
 /// Check if an IP address is always blocked regardless of policy.
 ///
-/// Loopback and link-local addresses are never allowed even when an endpoint
+/// Loopback, link-local, and unspecified addresses are never allowed even when an endpoint
 /// has `allowed_ips` configured. This prevents proxy bypass (loopback) and
 /// cloud metadata SSRF (link-local 169.254.x.x).
 fn is_always_blocked_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_unspecified(),
         IpAddr::V6(v6) => {
-            if v6.is_loopback() {
+            if v6.is_loopback() || v6.is_unspecified() {
                 return true;
             }
             // fe80::/10 — IPv6 link-local
@@ -1219,7 +1308,7 @@ fn is_always_blocked_ip(ip: IpAddr) -> bool {
             }
             // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback() || v4.is_link_local();
+                return v4.is_loopback() || v4.is_link_local() || v4.is_unspecified();
             }
             false
         }
@@ -1249,6 +1338,13 @@ async fn resolve_and_check_allowed_ips(
         ));
     }
 
+    // Block control-plane ports regardless of IP match.
+    if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) {
+        return Err(format!(
+            "port {port} is a blocked control-plane port, connection rejected"
+        ));
+    }
+
     for addr in &addrs {
         // Always block loopback and link-local
         if is_always_blocked_ip(addr.ip()) {
@@ -1271,11 +1367,27 @@ async fn resolve_and_check_allowed_ips(
     Ok(addrs)
 }
 
+/// Minimum CIDR prefix length before logging a breadth warning.
+/// CIDRs broader than /16 (65,536+ addresses) may unintentionally expose
+/// control-plane services on the same network.
+const MIN_SAFE_PREFIX_LEN: u8 = 16;
+
+/// Ports that are always blocked in `resolve_and_check_allowed_ips`, even
+/// when the resolved IP matches an `allowed_ips` entry.  These ports belong
+/// to control-plane services that should never be reachable from a sandbox.
+const BLOCKED_CONTROL_PLANE_PORTS: &[u16] = &[
+    2379,  // etcd client
+    2380,  // etcd peer
+    6443,  // Kubernetes API server
+    10250, // kubelet API
+    10255, // kubelet read-only
+];
+
 /// Parse CIDR/IP strings into `IpNet` values, rejecting invalid entries and
 /// entries that cover loopback or link-local ranges.
 ///
 /// Returns parsed networks on success, or an error describing which entries
-/// are invalid.
+/// are invalid. Logs a warning for overly broad CIDRs.
 fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, String> {
     let mut nets = Vec::with_capacity(raw.len());
     let mut errors = Vec::new();
@@ -1293,7 +1405,17 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
         });
 
         match parsed {
-            Ok(n) => nets.push(n),
+            Ok(n) => {
+                if n.prefix_len() < MIN_SAFE_PREFIX_LEN {
+                    warn!(
+                        cidr = %n,
+                        prefix_len = n.prefix_len(),
+                        "allowed_ips entry has a very broad CIDR (< /{MIN_SAFE_PREFIX_LEN}); \
+                         this may expose control-plane services on the same network"
+                    );
+                }
+                nets.push(n);
+            }
             Err(_) => errors.push(format!("invalid CIDR/IP in allowed_ips: {entry}")),
         }
     }
@@ -1707,7 +1829,12 @@ async fn handle_forward_proxy(
     //    - If allowed_ips is set: validate resolved IPs against the allowlist
     //      (this is the SSRF override for private IP destinations).
     //    - If allowed_ips is empty: reject internal IPs, allow public IPs through.
-    let raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
+    //    When the policy host is already a literal IP address, treat it as
+    //    implicitly allowed — the user explicitly declared the destination.
+    let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
+    if raw_allowed_ips.is_empty() {
+        raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
+    }
 
     let addrs = if !raw_allowed_ips.is_empty() {
         // allowed_ips mode: validate resolved IPs against CIDR allowlist.
@@ -1902,6 +2029,11 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_ipv4_unspecified() {
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    }
+
+    #[test]
     fn test_allows_ipv4_public() {
         assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
@@ -1919,6 +2051,11 @@ mod tests {
     #[test]
     fn test_rejects_ipv6_loopback() {
         assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn test_rejects_ipv6_unspecified() {
+        assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
     }
 
     #[test]
@@ -2070,10 +2207,9 @@ mod tests {
         let err = openshell_router::RouterError::RouteNotFound("local".into());
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 400);
-        assert!(
-            msg.contains("local"),
-            "message should contain the hint: {msg}"
-        );
+        assert_eq!(msg, "no inference route configured");
+        // SEC-008: must NOT leak the route hint to sandboxed code
+        assert!(!msg.contains("local"));
     }
 
     #[test]
@@ -2081,42 +2217,56 @@ mod tests {
         let err = openshell_router::RouterError::NoCompatibleRoute("anthropic_messages".into());
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 400);
-        assert!(
-            msg.contains("anthropic_messages"),
-            "message should contain the protocol: {msg}"
-        );
+        assert_eq!(msg, "no compatible inference route available");
+        // SEC-008: must NOT leak the protocol name to sandboxed code
+        assert!(!msg.contains("anthropic_messages"));
     }
 
     #[test]
     fn router_error_unauthorized_maps_to_401() {
-        let err = openshell_router::RouterError::Unauthorized("bad token".into());
+        let err =
+            openshell_router::RouterError::Unauthorized("bad token from 10.0.0.5:8080".into());
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 401);
-        assert_eq!(msg, "bad token");
+        assert_eq!(msg, "unauthorized");
+        // SEC-008: must NOT leak upstream details to sandboxed code
+        assert!(!msg.contains("10.0.0.5"));
     }
 
     #[test]
     fn router_error_upstream_unavailable_maps_to_503() {
-        let err = openshell_router::RouterError::UpstreamUnavailable("connection refused".into());
+        let err = openshell_router::RouterError::UpstreamUnavailable(
+            "connection refused to 10.0.0.5:8080".into(),
+        );
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 503);
-        assert_eq!(msg, "connection refused");
+        assert_eq!(msg, "inference service unavailable");
+        // SEC-008: must NOT leak upstream address to sandboxed code
+        assert!(!msg.contains("10.0.0.5"));
     }
 
     #[test]
     fn router_error_upstream_protocol_maps_to_502() {
-        let err = openshell_router::RouterError::UpstreamProtocol("bad gateway".into());
+        let err = openshell_router::RouterError::UpstreamProtocol(
+            "TLS handshake failed for nim.internal.svc:443".into(),
+        );
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 502);
-        assert_eq!(msg, "bad gateway");
+        assert_eq!(msg, "inference service error");
+        // SEC-008: must NOT leak internal hostnames to sandboxed code
+        assert!(!msg.contains("nim.internal"));
     }
 
     #[test]
     fn router_error_internal_maps_to_502() {
-        let err = openshell_router::RouterError::Internal("unexpected".into());
+        let err = openshell_router::RouterError::Internal(
+            "failed to read /etc/openshell/routes.json".into(),
+        );
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 502);
-        assert_eq!(msg, "unexpected");
+        assert_eq!(msg, "inference service error");
+        // SEC-008: must NOT leak file paths to sandboxed code
+        assert!(!msg.contains("/etc/openshell"));
     }
 
     #[test]
@@ -2188,6 +2338,16 @@ mod tests {
         assert!(is_always_blocked_ip(IpAddr::V6(Ipv6Addr::new(
             0xfe80, 0, 0, 0, 0, 0, 0, 1
         ))));
+    }
+
+    #[test]
+    fn test_always_blocked_ipv4_unspecified() {
+        assert!(is_always_blocked_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    }
+
+    #[test]
+    fn test_always_blocked_ipv6_unspecified() {
+        assert!(is_always_blocked_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
     }
 
     #[test]
@@ -2296,6 +2456,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolve_check_allowed_ips_blocks_unspecified() {
+        let nets = parse_allowed_ips(&["0.0.0.0/0".to_string()]).unwrap();
+        let result = resolve_and_check_allowed_ips("0.0.0.0", 80, &nets).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("always-blocked"),
+            "expected 'always-blocked' in error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_resolve_check_allowed_ips_rejects_outside_allowlist() {
         // 8.8.8.8 resolves to a public IP which is NOT in 10.0.0.0/8
         let nets = parse_allowed_ips(&["10.0.0.0/8".to_string()]).unwrap();
@@ -2306,6 +2478,42 @@ mod tests {
             err.contains("not in allowed_ips"),
             "expected 'not in allowed_ips' in error: {err}"
         );
+    }
+
+    // --- SEC-005: CIDR breadth warning and control-plane port blocklist ---
+
+    #[tokio::test]
+    async fn test_resolve_check_allowed_ips_blocks_control_plane_ports() {
+        let nets = parse_allowed_ips(&["0.0.0.0/0".to_string()]).unwrap();
+        // K8s API server port
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 6443, &nets).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked control-plane port"));
+
+        // etcd client port
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 2379, &nets).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked control-plane port"));
+
+        // kubelet API port
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 10250, &nets).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked control-plane port"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_check_allowed_ips_allows_non_control_plane_ports() {
+        // Port 443 should not be blocked by the control-plane port list
+        let nets = parse_allowed_ips(&["8.8.8.0/24".to_string()]).unwrap();
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 443, &nets).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_broad_cidr_is_accepted() {
+        // Broad CIDRs are accepted (just warned about) -- design trade-off
+        let result = parse_allowed_ips(&["10.0.0.0/8".to_string()]);
+        assert!(result.is_ok());
     }
 
     // --- extract_host_from_uri tests ---
@@ -2594,5 +2802,31 @@ mod tests {
             err.contains("always-blocked"),
             "expected 'always-blocked' in error: {err}"
         );
+    }
+
+    // -- implicit_allowed_ips_for_ip_host --
+
+    #[test]
+    fn test_implicit_allowed_ips_returns_ip_for_ipv4_literal() {
+        let result = implicit_allowed_ips_for_ip_host("192.168.1.100");
+        assert_eq!(result, vec!["192.168.1.100"]);
+    }
+
+    #[test]
+    fn test_implicit_allowed_ips_returns_ip_for_ipv6_literal() {
+        let result = implicit_allowed_ips_for_ip_host("::1");
+        assert_eq!(result, vec!["::1"]);
+    }
+
+    #[test]
+    fn test_implicit_allowed_ips_returns_empty_for_hostname() {
+        let result = implicit_allowed_ips_for_ip_host("api.github.com");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_implicit_allowed_ips_returns_empty_for_wildcard() {
+        let result = implicit_allowed_ips_for_ip_host("*.example.com");
+        assert!(result.is_empty());
     }
 }

@@ -1012,6 +1012,7 @@ impl OpenShell for OpenShellService {
                 "environment keys must match ^[A-Za-z_][A-Za-z0-9_]*$",
             ));
         }
+        validate_exec_request_fields(&req)?;
 
         let sandbox = self
             .state
@@ -1026,7 +1027,8 @@ impl OpenShell for OpenShellService {
         }
 
         let (target_host, target_port) = resolve_sandbox_exec_target(&self.state, &sandbox).await?;
-        let command_str = build_remote_exec_command(&req);
+        let command_str = build_remote_exec_command(&req)
+            .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
         let stdin_payload = req.stdin;
         let timeout_seconds = req.timeout_seconds;
         let sandbox_id = sandbox.id;
@@ -2522,22 +2524,63 @@ async fn merge_chunk_into_policy(
 
         let base_version = latest.as_ref().map_or(0, |r| r.version);
 
-        // Merge: if a rule for this endpoint already exists, add the binary
-        // to its binaries list. Otherwise insert the whole proposed rule.
-        if let Some(existing) = policy.network_policies.get_mut(&chunk.rule_name) {
-            // Add the chunk's binary if not already present.
+        // Merge: find an existing rule that covers the same (host, port),
+        // regardless of its map key / rule name.  This prevents duplicate
+        // entries when the mechanistic mapper generates a name like
+        // "allow_192_168_86_157_8567" and the user's original rule uses a
+        // different name (e.g. "test_server").
+        //
+        // Search order:
+        // 1. Exact rule_name match (fast path — covers auto-generated chunks
+        //    being re-approved and user rules whose names happen to match).
+        // 2. Scan all entries for a host:port endpoint match.
+        // 3. Fall through to insertion if neither matches.
+        let chunk_host_lc = chunk.host.to_lowercase();
+        let chunk_port = chunk.port as u32;
+
+        let merge_key = if policy.network_policies.contains_key(&chunk.rule_name) {
+            Some(chunk.rule_name.clone())
+        } else {
+            policy
+                .network_policies
+                .iter()
+                .find_map(|(key, existing_rule)| {
+                    let has_match = existing_rule.endpoints.iter().any(|ep| {
+                        let host_match = ep.host.to_lowercase() == chunk_host_lc;
+                        let port_match = if ep.ports.is_empty() {
+                            ep.port == chunk_port
+                        } else {
+                            ep.ports.contains(&chunk_port)
+                        };
+                        host_match && port_match
+                    });
+                    has_match.then(|| key.clone())
+                })
+        };
+
+        if let Some(key) = merge_key {
+            let existing = policy.network_policies.get_mut(&key).unwrap();
+            // Add the chunk's binaries if not already present.
             for b in &rule.binaries {
                 if !existing.binaries.iter().any(|eb| eb.path == b.path) {
                     existing.binaries.push(b.clone());
                 }
             }
-            // Also merge endpoints and L7 rules in case they differ.
+            // Merge endpoints: for matching host:port, merge fields like
+            // allowed_ips into the existing endpoint rather than duplicating.
             for ep in &rule.endpoints {
-                if !existing
-                    .endpoints
-                    .iter()
-                    .any(|e| e.host == ep.host && e.port == ep.port)
-                {
+                if let Some(existing_ep) = existing.endpoints.iter_mut().find(|e| {
+                    e.host.to_lowercase() == ep.host.to_lowercase()
+                        && (e.port == ep.port
+                            || (!e.ports.is_empty() && e.ports.contains(&ep.port)))
+                }) {
+                    // Merge allowed_ips into the existing endpoint.
+                    for ip in &ep.allowed_ips {
+                        if !existing_ep.allowed_ips.contains(ip) {
+                            existing_ep.allowed_ips.push(ip.clone());
+                        }
+                    }
+                } else {
                     existing.endpoints.push(ep.clone());
                 }
             }
@@ -3409,34 +3452,122 @@ async fn resolve_sandbox_exec_target(
     ))
 }
 
-fn shell_escape(value: &str) -> String {
+/// Maximum number of arguments in the command array.
+const MAX_EXEC_COMMAND_ARGS: usize = 1024;
+/// Maximum length of a single command argument or environment value (bytes).
+const MAX_EXEC_ARG_LEN: usize = 32 * 1024; // 32 KiB
+/// Maximum length of the workdir field (bytes).
+const MAX_EXEC_WORKDIR_LEN: usize = 4096;
+
+/// Validate fields of an ExecSandboxRequest for control characters and size
+/// limits before constructing a shell command string.
+fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(), Status> {
+    if req.command.len() > MAX_EXEC_COMMAND_ARGS {
+        return Err(Status::invalid_argument(format!(
+            "command array exceeds {} argument limit",
+            MAX_EXEC_COMMAND_ARGS
+        )));
+    }
+    for (i, arg) in req.command.iter().enumerate() {
+        if arg.len() > MAX_EXEC_ARG_LEN {
+            return Err(Status::invalid_argument(format!(
+                "command argument {i} exceeds {} byte limit",
+                MAX_EXEC_ARG_LEN
+            )));
+        }
+        reject_control_chars(arg, &format!("command argument {i}"))?;
+    }
+    for (key, value) in &req.environment {
+        if value.len() > MAX_EXEC_ARG_LEN {
+            return Err(Status::invalid_argument(format!(
+                "environment value for '{key}' exceeds {} byte limit",
+                MAX_EXEC_ARG_LEN
+            )));
+        }
+        reject_control_chars(value, &format!("environment value for '{key}'"))?;
+    }
+    if !req.workdir.is_empty() {
+        if req.workdir.len() > MAX_EXEC_WORKDIR_LEN {
+            return Err(Status::invalid_argument(format!(
+                "workdir exceeds {} byte limit",
+                MAX_EXEC_WORKDIR_LEN
+            )));
+        }
+        reject_control_chars(&req.workdir, "workdir")?;
+    }
+    Ok(())
+}
+
+/// Reject null bytes and newlines in a user-supplied value.
+fn reject_control_chars(value: &str, field_name: &str) -> Result<(), Status> {
+    if value.bytes().any(|b| b == 0) {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} contains null bytes"
+        )));
+    }
+    if value.bytes().any(|b| b == b'\n' || b == b'\r') {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} contains newline or carriage return characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Shell-escape a value for embedding in a POSIX shell command.
+///
+/// Wraps unsafe values in single quotes with the standard `'\''` idiom for
+/// embedded single-quote characters. Rejects null bytes which can truncate
+/// shell parsing at the C level.
+fn shell_escape(value: &str) -> Result<String, String> {
+    // Reject null bytes — can truncate shell parsing at the C level.
+    if value.bytes().any(|b| b == 0) {
+        return Err("value contains null bytes".to_string());
+    }
+    // Reject newlines and carriage returns — safe within single quotes for
+    // one shell layer, but dangerous when the command string traverses
+    // multiple interpretation boundaries (SSH transport + bash -lc).
+    if value.bytes().any(|b| b == b'\n' || b == b'\r') {
+        return Err("value contains newline or carriage return".to_string());
+    }
     if value.is_empty() {
-        return "''".to_string();
+        return Ok("''".to_string());
     }
     let safe = value
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/' | b'-' | b'_'));
     if safe {
-        return value.to_string();
+        return Ok(value.to_string());
     }
     let escaped = value.replace('\'', "'\"'\"'");
-    format!("'{escaped}'")
+    Ok(format!("'{escaped}'"))
 }
 
-fn build_remote_exec_command(req: &ExecSandboxRequest) -> String {
+/// Maximum total length of the assembled shell command string.
+const MAX_COMMAND_STRING_LEN: usize = 256 * 1024; // 256 KiB
+
+fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String> {
     let mut parts = Vec::new();
     let mut env_entries = req.environment.iter().collect::<Vec<_>>();
     env_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
     for (key, value) in env_entries {
-        parts.push(format!("{key}={}", shell_escape(value)));
+        parts.push(format!("{key}={}", shell_escape(value)?));
     }
-    parts.extend(req.command.iter().map(|arg| shell_escape(arg)));
+    for arg in &req.command {
+        parts.push(shell_escape(arg)?);
+    }
     let command = parts.join(" ");
-    if req.workdir.is_empty() {
+    let result = if req.workdir.is_empty() {
         command
     } else {
-        format!("cd {} && {command}", shell_escape(&req.workdir))
+        format!("cd {} && {command}", shell_escape(&req.workdir)?)
+    };
+    if result.len() > MAX_COMMAND_STRING_LEN {
+        return Err(format!(
+            "assembled command string exceeds {} byte limit",
+            MAX_COMMAND_STRING_LEN
+        ));
     }
+    Ok(result)
 }
 
 /// Resolved provider environment split into secret credentials and non-secret config.
@@ -3555,10 +3686,14 @@ async fn stream_exec_over_ssh(
     timeout_seconds: u32,
     handshake_secret: &str,
 ) -> Result<(), Status> {
+    let command_preview: String = command.chars().take(120).collect();
     info!(
         sandbox_id = %sandbox_id,
         target_host = %target_host,
         target_port,
+        command_len = command.len(),
+        stdin_len = stdin_payload.len(),
+        command_preview = %command_preview,
         "ExecSandbox command started"
     );
 
@@ -3678,6 +3813,20 @@ async fn run_exec_with_russh(
     stdin_payload: Vec<u8>,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
+    // Defense-in-depth: validate command at the transport boundary even though
+    // exec_sandbox and build_remote_exec_command already validate upstream.
+    if command.as_bytes().contains(&0) {
+        return Err(Status::invalid_argument(
+            "command contains null bytes at transport boundary",
+        ));
+    }
+    if command.len() > MAX_COMMAND_STRING_LEN {
+        return Err(Status::invalid_argument(format!(
+            "command exceeds {} byte limit at transport boundary",
+            MAX_COMMAND_STRING_LEN
+        )));
+    }
+
     let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
         .await
         .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
@@ -3764,6 +3913,29 @@ async fn run_exec_with_russh(
     Ok(exit_code.unwrap_or(1))
 }
 
+/// Check whether an IP address is safe to use as an SSH proxy target.
+///
+/// Blocks loopback (prevents connecting back to the gateway server itself)
+/// and link-local addresses (prevents cloud metadata SSRF via 169.254.169.254).
+fn is_safe_ssh_proxy_target(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !v4.is_loopback() // 127.0.0.0/8
+            && !v4.is_link_local() // 169.254.0.0/16 (cloud metadata)
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return false; // ::1
+            }
+            // Check IPv4-mapped IPv6 addresses like ::ffff:127.0.0.1
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return !v4.is_loopback() && !v4.is_link_local();
+            }
+            true
+        }
+    }
+}
+
 async fn start_single_use_ssh_proxy(
     target_host: &str,
     target_port: u16,
@@ -3779,9 +3951,45 @@ async fn start_single_use_ssh_proxy(
             warn!("SSH proxy: failed to accept local connection");
             return;
         };
-        let Ok(mut sandbox_conn) = TcpStream::connect((target_host.as_str(), target_port)).await
-        else {
-            warn!(target_host = %target_host, target_port, "SSH proxy: failed to connect to sandbox");
+
+        // Resolve DNS and validate the target IP before connecting.
+        // This prevents SSRF if the sandbox status record were poisoned
+        // to point at loopback, cloud metadata, or other internal services.
+        let addr_str = format!("{}:{}", target_host, target_port);
+        let resolved = match tokio::net::lookup_host(&addr_str).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(addr) => addr,
+                None => {
+                    warn!(target_host = %target_host, "SSH proxy: DNS resolution returned no addresses");
+                    return;
+                }
+            },
+            Err(e) => {
+                warn!(target_host = %target_host, error = %e, "SSH proxy: DNS resolution failed");
+                return;
+            }
+        };
+
+        if !is_safe_ssh_proxy_target(resolved.ip()) {
+            warn!(
+                target_host = %target_host,
+                resolved_ip = %resolved.ip(),
+                "SSH proxy: target resolved to blocked IP range (loopback or link-local)"
+            );
+            return;
+        }
+
+        debug!(
+            target_host = %target_host,
+            resolved_ip = %resolved.ip(),
+            target_port,
+            "SSH proxy: connecting to validated target"
+        );
+
+        // Connect to the resolved address directly (not the hostname) to
+        // prevent TOCTOU between validation and connection.
+        let Ok(mut sandbox_conn) = TcpStream::connect(resolved).await else {
+            warn!(target_host = %target_host, resolved_ip = %resolved.ip(), target_port, "SSH proxy: failed to connect to sandbox");
             return;
         };
         let Ok(preface) = build_preface(&uuid::Uuid::new_v4().to_string(), &handshake_secret)
@@ -3862,14 +4070,13 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
 // Provider CRUD
 // ---------------------------------------------------------------------------
 
-/// Replace credential values with a redaction marker before returning in a
-/// gRPC response.  Key names are preserved so clients can display which
-/// credentials are configured.  Internal server paths (inference routing,
-/// sandbox env injection) read credentials from the store directly and are
-/// unaffected.
+/// Redact credential values from a provider before returning it in a gRPC
+/// response.  Key names are preserved so callers can display credential counts
+/// and key listings.  Internal server paths (inference routing, sandbox env
+/// injection) read credentials from the store directly and are unaffected.
 fn redact_provider_credentials(mut provider: Provider) -> Provider {
     for value in provider.credentials.values_mut() {
-        *value = "***".to_string();
+        *value = "REDACTED".to_string();
     }
     provider
 }
@@ -4052,9 +4259,10 @@ mod tests {
         MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
         MAX_NAME_LEN, MAX_PAGE_SIZE, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
         MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
-        MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE, clamp_limit,
-        create_provider_record, delete_provider_record, get_provider_record, is_valid_env_key,
-        list_provider_records, merge_chunk_into_policy, resolve_provider_environment,
+        MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
+        build_remote_exec_command, clamp_limit, create_provider_record, delete_provider_record,
+        get_provider_record, is_safe_ssh_proxy_target, is_valid_env_key, list_provider_records,
+        merge_chunk_into_policy, reject_control_chars, resolve_provider_environment, shell_escape,
         update_provider_record, validate_provider_fields, validate_sandbox_spec,
     };
     use crate::persistence::{DraftChunkRecord, Store};
@@ -4078,6 +4286,176 @@ mod tests {
         assert!(!is_valid_env_key("BAD KEY"));
         assert!(!is_valid_env_key("X=Y"));
         assert!(!is_valid_env_key("X;rm -rf /"));
+    }
+
+    // ---- SEC-002: shell_escape, reject_control_chars, build_remote_exec_command ----
+
+    #[test]
+    fn shell_escape_safe_chars_pass_through() {
+        assert_eq!(shell_escape("ls").unwrap(), "ls");
+        assert_eq!(shell_escape("/usr/bin/python").unwrap(), "/usr/bin/python");
+        assert_eq!(shell_escape("file.txt").unwrap(), "file.txt");
+        assert_eq!(shell_escape("my-cmd_v2").unwrap(), "my-cmd_v2");
+    }
+
+    #[test]
+    fn shell_escape_empty_string() {
+        assert_eq!(shell_escape("").unwrap(), "''");
+    }
+
+    #[test]
+    fn shell_escape_wraps_unsafe_chars() {
+        assert_eq!(shell_escape("hello world").unwrap(), "'hello world'");
+        assert_eq!(shell_escape("$(id)").unwrap(), "'$(id)'");
+        assert_eq!(shell_escape("; rm -rf /").unwrap(), "'; rm -rf /'");
+    }
+
+    #[test]
+    fn shell_escape_handles_single_quotes() {
+        assert_eq!(shell_escape("it's").unwrap(), "'it'\"'\"'s'");
+    }
+
+    #[test]
+    fn shell_escape_rejects_null_bytes() {
+        assert!(shell_escape("hello\x00world").is_err());
+    }
+
+    #[test]
+    fn shell_escape_rejects_newlines() {
+        assert!(shell_escape("line1\nline2").is_err());
+        assert!(shell_escape("line1\rline2").is_err());
+        assert!(shell_escape("line1\r\nline2").is_err());
+    }
+
+    #[test]
+    fn reject_control_chars_allows_normal_values() {
+        assert!(reject_control_chars("hello world", "test").is_ok());
+        assert!(reject_control_chars("$(cmd)", "test").is_ok());
+        assert!(reject_control_chars("", "test").is_ok());
+    }
+
+    #[test]
+    fn reject_control_chars_rejects_null_bytes() {
+        assert!(reject_control_chars("hello\x00world", "test").is_err());
+    }
+
+    #[test]
+    fn reject_control_chars_rejects_newlines() {
+        assert!(reject_control_chars("line1\nline2", "test").is_err());
+        assert!(reject_control_chars("line1\rline2", "test").is_err());
+    }
+
+    #[test]
+    fn build_remote_exec_command_basic() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["ls".to_string(), "-la".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(build_remote_exec_command(&req).unwrap(), "ls -la");
+    }
+
+    #[test]
+    fn build_remote_exec_command_with_env_and_workdir() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec![
+                "python".to_string(),
+                "-c".to_string(),
+                "print('ok')".to_string(),
+            ],
+            environment: [("HOME".to_string(), "/home/user".to_string())]
+                .into_iter()
+                .collect(),
+            workdir: "/workspace".to_string(),
+            ..Default::default()
+        };
+        let cmd = build_remote_exec_command(&req).unwrap();
+        assert!(cmd.starts_with("cd /workspace && "));
+        assert!(cmd.contains("HOME=/home/user"));
+        assert!(cmd.contains("'print('\"'\"'ok'\"'\"')'"));
+    }
+
+    #[test]
+    fn build_remote_exec_command_rejects_null_bytes_in_args() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["echo".to_string(), "hello\x00world".to_string()],
+            ..Default::default()
+        };
+        assert!(build_remote_exec_command(&req).is_err());
+    }
+
+    #[test]
+    fn build_remote_exec_command_rejects_newlines_in_workdir() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["ls".to_string()],
+            workdir: "/tmp\nmalicious".to_string(),
+            ..Default::default()
+        };
+        assert!(build_remote_exec_command(&req).is_err());
+    }
+
+    // ---- SEC-006: is_safe_ssh_proxy_target ----
+
+    #[test]
+    fn ssh_proxy_target_allows_pod_network_ips() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // Typical pod network IPs should be allowed
+        assert!(is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            10, 0, 0, 5
+        ))));
+        assert!(is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            172, 16, 0, 1
+        ))));
+        assert!(is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 100
+        ))));
+    }
+
+    #[test]
+    fn ssh_proxy_target_blocks_loopback() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        assert!(!is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
+        assert!(!is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 2
+        ))));
+        assert!(!is_safe_ssh_proxy_target(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn ssh_proxy_target_blocks_link_local() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // 169.254.169.254 is the cloud metadata endpoint
+        assert!(!is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+        assert!(!is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn ssh_proxy_target_blocks_ipv4_mapped_ipv6_loopback() {
+        use std::net::IpAddr;
+        // ::ffff:127.0.0.1
+        let ip: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(!is_safe_ssh_proxy_target(ip));
+    }
+
+    #[test]
+    fn ssh_proxy_target_blocks_ipv4_mapped_ipv6_link_local() {
+        use std::net::IpAddr;
+        // ::ffff:169.254.169.254
+        let ip: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
+        assert!(!is_safe_ssh_proxy_target(ip));
     }
 
     // ---- clamp_limit tests ----
@@ -4170,10 +4548,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(updated.id, provider_id);
-        // Credential values are redacted in responses but key names are preserved.
-        assert!(
-            updated.credentials.values().all(|v| v == "***"),
+        // Credential keys are preserved but values are redacted in responses.
+        assert_eq!(updated.credentials.len(), 2);
+        assert_eq!(
+            updated.credentials.get("API_TOKEN"),
+            Some(&"REDACTED".to_string()),
             "credential values must be redacted in gRPC responses"
+        );
+        assert_eq!(
+            updated.credentials.get("SECONDARY"),
+            Some(&"REDACTED".to_string()),
         );
         assert!(updated.credentials.contains_key("API_TOKEN"));
         // Verify the store still has full credentials.
@@ -4280,8 +4664,12 @@ mod tests {
 
         assert_eq!(updated.id, persisted.id);
         assert_eq!(updated.r#type, "nvidia");
-        // Credential values are redacted but key names are preserved.
-        assert!(updated.credentials.values().all(|v| v == "***"));
+        // Credential keys are preserved but values are redacted in responses.
+        assert_eq!(updated.credentials.len(), 2);
+        assert_eq!(
+            updated.credentials.get("API_TOKEN"),
+            Some(&"REDACTED".to_string())
+        );
         assert_eq!(updated.config.len(), 2);
         assert_eq!(
             updated.config.get("endpoint"),
@@ -4320,9 +4708,13 @@ mod tests {
         .await
         .unwrap();
 
-        // Credential values are redacted but key names are preserved.
+        // Credential keys are preserved but values are redacted; SECONDARY was deleted.
         assert_eq!(updated.credentials.len(), 1);
-        assert_eq!(updated.credentials.get("API_TOKEN"), Some(&"***".to_string()));
+        assert_eq!(
+            updated.credentials.get("API_TOKEN"),
+            Some(&"REDACTED".to_string())
+        );
+        assert!(updated.credentials.get("SECONDARY").is_none());
         assert_eq!(updated.config.len(), 1);
         assert_eq!(
             updated.config.get("endpoint"),
@@ -5062,6 +5454,206 @@ mod tests {
         assert_eq!(stored_rule.endpoints[0].host, "google.com");
         assert_eq!(stored_rule.endpoints[0].port, 443);
         assert_eq!(stored_rule.binaries[0].path, "/usr/bin/curl");
+    }
+
+    #[tokio::test]
+    async fn merge_chunk_merges_into_existing_rule_by_host_port() {
+        // When a user's policy has a rule named "test_server" covering
+        // 192.168.1.100:8567, and the mechanistic mapper generates a chunk
+        // named "allow_192_168_1_100_8567" for the same host:port, the merge
+        // should add allowed_ips into the existing "test_server" entry rather
+        // than creating a duplicate.
+        use openshell_core::proto::{
+            NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+        };
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let sandbox_id = "sb-merge";
+
+        // Seed an initial policy with a user-named rule.
+        let initial_policy = SandboxPolicy {
+            network_policies: [(
+                "test_server".to_string(),
+                NetworkPolicyRule {
+                    name: "test_server".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "192.168.1.100".to_string(),
+                        port: 8567,
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                        ..Default::default()
+                    }],
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        store
+            .put_policy_revision(
+                "p-seed",
+                sandbox_id,
+                1,
+                &initial_policy.encode_to_vec(),
+                "seed-hash",
+            )
+            .await
+            .unwrap();
+
+        // Build a chunk with a different rule_name but same host:port.
+        let proposed = NetworkPolicyRule {
+            name: "allow_192_168_1_100_8567".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "192.168.1.100".to_string(),
+                port: 8567,
+                allowed_ips: vec!["192.168.1.100".to_string()],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let chunk = DraftChunkRecord {
+            id: "chunk-merge".to_string(),
+            sandbox_id: sandbox_id.to_string(),
+            draft_version: 1,
+            status: "pending".to_string(),
+            rule_name: "allow_192_168_1_100_8567".to_string(),
+            proposed_rule: proposed.encode_to_vec(),
+            rationale: String::new(),
+            security_notes: String::new(),
+            confidence: 0.3,
+            created_at_ms: 0,
+            decided_at_ms: None,
+            host: "192.168.1.100".to_string(),
+            port: 8567,
+            binary: "/usr/bin/curl".to_string(),
+            hit_count: 1,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+        };
+
+        let (version, _) = merge_chunk_into_policy(&store, sandbox_id, &chunk)
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+
+        let latest = store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .expect("policy revision should be persisted");
+        let policy = SandboxPolicy::decode(latest.policy_payload.as_slice()).unwrap();
+
+        // Should have exactly one network_policies entry (no duplicate).
+        assert_eq!(
+            policy.network_policies.len(),
+            1,
+            "expected 1 rule, got {}: {:?}",
+            policy.network_policies.len(),
+            policy.network_policies.keys().collect::<Vec<_>>()
+        );
+        // The entry should keep the user's original key name.
+        let rule = policy
+            .network_policies
+            .get("test_server")
+            .expect("original rule name 'test_server' should be preserved");
+        assert_eq!(rule.endpoints[0].host, "192.168.1.100");
+        // allowed_ips should have been merged in.
+        assert_eq!(rule.endpoints[0].allowed_ips, vec!["192.168.1.100"]);
+    }
+
+    #[tokio::test]
+    async fn merge_chunk_new_host_port_inserts_new_entry() {
+        // When a chunk's host:port doesn't match any existing rule, it should
+        // be inserted as a new entry (existing behavior preserved).
+        use openshell_core::proto::{
+            NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+        };
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let sandbox_id = "sb-new";
+
+        let initial_policy = SandboxPolicy {
+            network_policies: [(
+                "existing_rule".to_string(),
+                NetworkPolicyRule {
+                    name: "existing_rule".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                        ..Default::default()
+                    }],
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        store
+            .put_policy_revision(
+                "p-seed",
+                sandbox_id,
+                1,
+                &initial_policy.encode_to_vec(),
+                "seed-hash",
+            )
+            .await
+            .unwrap();
+
+        // Chunk for a different host:port.
+        let proposed = NetworkPolicyRule {
+            name: "allow_10_0_0_5_8080".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "10.0.0.5".to_string(),
+                port: 8080,
+                allowed_ips: vec!["10.0.0.5".to_string()],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let chunk = DraftChunkRecord {
+            id: "chunk-new".to_string(),
+            sandbox_id: sandbox_id.to_string(),
+            draft_version: 1,
+            status: "pending".to_string(),
+            rule_name: "allow_10_0_0_5_8080".to_string(),
+            proposed_rule: proposed.encode_to_vec(),
+            rationale: String::new(),
+            security_notes: String::new(),
+            confidence: 0.3,
+            created_at_ms: 0,
+            decided_at_ms: None,
+            host: "10.0.0.5".to_string(),
+            port: 8080,
+            binary: "/usr/bin/curl".to_string(),
+            hit_count: 1,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+        };
+
+        let (version, _) = merge_chunk_into_policy(&store, sandbox_id, &chunk)
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+
+        let latest = store.get_latest_policy(sandbox_id).await.unwrap().unwrap();
+        let policy = SandboxPolicy::decode(latest.policy_payload.as_slice()).unwrap();
+
+        // Should have two entries now.
+        assert_eq!(policy.network_policies.len(), 2);
+        assert!(policy.network_policies.contains_key("existing_rule"));
+        assert!(policy.network_policies.contains_key("allow_10_0_0_5_8080"));
     }
 
     // ── petname default name generation ───────────────────────────────

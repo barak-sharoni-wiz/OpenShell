@@ -88,7 +88,24 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
     // Parse request line
     let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
 
-    let header_str = String::from_utf8_lossy(&buf[..header_end]);
+    // Reject bare LF in headers (must use \r\n line endings per RFC 7230).
+    // Bare LF can cause parsing discrepancies between this proxy and upstream
+    // servers, enabling request smuggling via header injection.
+    for i in 0..header_end {
+        if buf[i] == b'\n' && (i == 0 || buf[i - 1] != b'\r') {
+            return Err(miette!(
+                "HTTP headers contain bare LF (line feed without carriage return)"
+            ));
+        }
+    }
+
+    // Strict UTF-8 validation. from_utf8_lossy would silently replace invalid
+    // bytes with U+FFFD, creating an interpretation gap between this proxy
+    // (which parses the lossy string) and upstream servers (which receive the
+    // raw bytes). This gap enables request smuggling via mutated header names.
+    let header_str = std::str::from_utf8(&buf[..header_end])
+        .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+
     let request_line = header_str
         .lines()
         .next()
@@ -103,9 +120,15 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
         .next()
         .ok_or_else(|| miette!("Missing HTTP path"))?
         .to_string();
+    let version = parts
+        .next()
+        .ok_or_else(|| miette!("Missing HTTP version"))?;
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err(miette!("Unsupported HTTP version: {version}"));
+    }
 
     // Determine body framing from headers
-    let body_length = parse_body_length(&header_str);
+    let body_length = parse_body_length(header_str)?;
 
     Ok(Some(L7Request {
         action: method,
@@ -168,7 +191,8 @@ where
         BodyLength::None => {}
     }
     upstream.flush().await.into_diagnostic()?;
-    relay_response(&req.action, upstream, client).await
+    let (reusable, _) = relay_response(&req.action, upstream, client).await?;
+    Ok(reusable)
 }
 
 /// Send a 403 Forbidden JSON deny response.
@@ -206,23 +230,43 @@ async fn send_deny_response<C: AsyncWrite + Unpin>(
 }
 
 /// Parse Content-Length or Transfer-Encoding from HTTP headers.
-fn parse_body_length(headers: &str) -> BodyLength {
+///
+/// Per RFC 7230 Section 3.3.3, rejects requests containing both
+/// `Content-Length` and `Transfer-Encoding` headers to prevent request
+/// smuggling via CL/TE ambiguity.
+fn parse_body_length(headers: &str) -> Result<BodyLength> {
+    let mut has_te_chunked = false;
+    let mut cl_value: Option<u64> = None;
+
     for line in headers.lines().skip(1) {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("transfer-encoding:") {
             let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
             if val.contains("chunked") {
-                return BodyLength::Chunked;
+                has_te_chunked = true;
             }
         }
         if lower.starts_with("content-length:")
             && let Some(val) = lower.split_once(':').map(|(_, v)| v.trim())
             && let Ok(len) = val.parse::<u64>()
         {
-            return BodyLength::ContentLength(len);
+            cl_value = Some(len);
         }
     }
-    BodyLength::None
+
+    if has_te_chunked && cl_value.is_some() {
+        return Err(miette!(
+            "Request contains both Transfer-Encoding and Content-Length headers"
+        ));
+    }
+
+    if has_te_chunked {
+        return Ok(BodyLength::Chunked);
+    }
+    if let Some(len) = cl_value {
+        return Ok(BodyLength::ContentLength(len));
+    }
+    Ok(BodyLength::None)
 }
 
 /// Relay exactly `len` bytes from reader to writer.
@@ -373,11 +417,27 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
 ///
 /// Returns `true` if the upstream connection is reusable (keep-alive),
 /// `false` if it was consumed (read-until-EOF or `Connection: close`).
+/// Relay an HTTP response from upstream back to the client.
+///
+/// Returns `true` if the connection should stay alive for further requests.
+pub(crate) async fn relay_response_to_client<U, C>(
+    upstream: &mut U,
+    client: &mut C,
+    request_method: &str,
+) -> Result<bool>
+where
+    U: AsyncRead + Unpin,
+    C: AsyncWrite + Unpin,
+{
+    let (reusable, _status) = relay_response(request_method, upstream, client).await?;
+    Ok(reusable)
+}
+
 async fn relay_response<U, C>(
     request_method: &str,
     upstream: &mut U,
     client: &mut C,
-) -> Result<bool>
+) -> Result<(bool, u16)>
 where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
@@ -398,7 +458,7 @@ where
             if !buf.is_empty() {
                 client.write_all(&buf).await.into_diagnostic()?;
             }
-            return Ok(false);
+            return Ok((false, 0));
         }
         buf.extend_from_slice(&tmp[..n]);
 
@@ -413,7 +473,7 @@ where
     let header_str = String::from_utf8_lossy(&buf[..header_end]);
     let status_code = parse_status_code(&header_str).unwrap_or(200);
     let server_wants_close = parse_connection_close(&header_str);
-    let body_length = parse_body_length(&header_str);
+    let body_length = parse_body_length(&header_str)?;
 
     debug!(
         status_code,
@@ -431,7 +491,7 @@ where
             .await
             .into_diagnostic()?;
         client.flush().await.into_diagnostic()?;
-        return Ok(!server_wants_close);
+        return Ok((!server_wants_close, status_code));
     }
 
     // No explicit framing (no Content-Length, no Transfer-Encoding).
@@ -451,7 +511,7 @@ where
             }
             relay_until_eof(upstream, client).await?;
             client.flush().await.into_diagnostic()?;
-            return Ok(false);
+            return Ok((false, status_code));
         }
         // No Connection: close — an HTTP/1.1 keep-alive server that omits
         // framing headers has an empty body.  Forward headers and continue
@@ -462,7 +522,7 @@ where
             .await
             .into_diagnostic()?;
         client.flush().await.into_diagnostic()?;
-        return Ok(true);
+        return Ok((true, status_code));
     }
 
     // Forward response headers + any overflow body bytes
@@ -495,7 +555,7 @@ where
     // loop will exit via the normal error path.  Exiting early here would
     // tear down the CONNECT tunnel before the client can detect the close,
     // causing ~30 s retry delays in clients like `gh`.
-    Ok(true)
+    Ok((true, status_code))
 }
 
 /// Parse the HTTP status code from a response status line.
@@ -596,7 +656,7 @@ mod tests {
     #[test]
     fn parse_content_length() {
         let headers = "POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 42\r\n\r\n";
-        match parse_body_length(headers) {
+        match parse_body_length(headers).unwrap() {
             BodyLength::ContentLength(42) => {}
             other => panic!("Expected ContentLength(42), got {other:?}"),
         }
@@ -606,7 +666,7 @@ mod tests {
     fn parse_chunked() {
         let headers =
             "POST /api HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n";
-        match parse_body_length(headers) {
+        match parse_body_length(headers).unwrap() {
             BodyLength::Chunked => {}
             other => panic!("Expected Chunked, got {other:?}"),
         }
@@ -615,10 +675,75 @@ mod tests {
     #[test]
     fn parse_no_body() {
         let headers = "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        match parse_body_length(headers) {
+        match parse_body_length(headers).unwrap() {
             BodyLength::None => {}
             other => panic!("Expected None, got {other:?}"),
         }
+    }
+
+    /// SEC-009: Reject requests with both Content-Length and Transfer-Encoding
+    /// to prevent CL/TE request smuggling (RFC 7230 Section 3.3.3).
+    #[test]
+    fn reject_dual_content_length_and_transfer_encoding() {
+        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(
+            parse_body_length(headers).is_err(),
+            "Must reject request with both CL and TE"
+        );
+    }
+
+    /// SEC-009: Same rejection regardless of header order.
+    #[test]
+    fn reject_dual_transfer_encoding_and_content_length() {
+        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n";
+        assert!(
+            parse_body_length(headers).is_err(),
+            "Must reject request with both TE and CL"
+        );
+    }
+
+    /// SEC-009: Bare LF in headers enables header injection.
+    #[tokio::test]
+    async fn reject_bare_lf_in_headers() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            // Bare \n between two header values creates a parsing discrepancy
+            writer
+                .write_all(
+                    b"GET /api HTTP/1.1\r\nX-Injected: value\nEvil: header\r\nHost: x\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let result = parse_http_request(&mut client).await;
+        assert!(result.is_err(), "Must reject headers with bare LF");
+    }
+
+    /// SEC-009: Invalid UTF-8 in headers creates interpretation gap.
+    #[tokio::test]
+    async fn reject_invalid_utf8_in_headers() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let mut raw = Vec::new();
+            raw.extend_from_slice(b"GET /api HTTP/1.1\r\nHost: x\r\nX-Bad: \xc0\xaf\r\n\r\n");
+            writer.write_all(&raw).await.unwrap();
+        });
+        let result = parse_http_request(&mut client).await;
+        assert!(result.is_err(), "Must reject headers with invalid UTF-8");
+    }
+
+    /// SEC-009: Reject unsupported HTTP versions.
+    #[tokio::test]
+    async fn reject_invalid_http_version() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /api JUNK/9.9\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let result = parse_http_request(&mut client).await;
+        assert!(result.is_err(), "Must reject unsupported HTTP version");
     }
 
     /// Regression test: two pipelined requests in a single write must be
@@ -733,7 +858,7 @@ mod tests {
         .await
         .expect("relay_response should not deadlock");
 
-        let reusable = result.expect("relay_response should succeed");
+        let (reusable, _status) = result.expect("relay_response should succeed");
         assert!(!reusable, "connection consumed by read-until-EOF");
 
         client_write.shutdown().await.unwrap();
@@ -771,7 +896,7 @@ mod tests {
         .await
         .expect("must not block when no Connection: close");
 
-        let reusable = result.expect("relay_response should succeed");
+        let (reusable, _status) = result.expect("relay_response should succeed");
         assert!(reusable, "keep-alive implied, connection reusable");
 
         client_write.shutdown().await.unwrap();
@@ -804,7 +929,7 @@ mod tests {
         .await
         .expect("HEAD relay must not deadlock waiting for body");
 
-        let reusable = result.expect("relay_response should succeed");
+        let (reusable, _status) = result.expect("relay_response should succeed");
         assert!(reusable, "HEAD response should be reusable");
 
         client_write.shutdown().await.unwrap();
@@ -834,7 +959,7 @@ mod tests {
         .await
         .expect("204 relay must not deadlock");
 
-        let reusable = result.expect("relay_response should succeed");
+        let (reusable, _status) = result.expect("relay_response should succeed");
         assert!(reusable, "204 response should be reusable");
 
         client_write.shutdown().await.unwrap();
@@ -866,7 +991,7 @@ mod tests {
         .await
         .expect("must not block when chunked body is complete in overflow");
 
-        let reusable = result.expect("relay_response should succeed");
+        let (reusable, _status) = result.expect("relay_response should succeed");
         assert!(reusable, "connection should be reusable");
 
         client_write.shutdown().await.unwrap();
@@ -902,7 +1027,7 @@ mod tests {
         .await
         .expect("must not block when chunked response has trailers");
 
-        let reusable = result.expect("relay_response should succeed");
+        let (reusable, _status) = result.expect("relay_response should succeed");
         assert!(reusable, "chunked response should be reusable");
 
         client_write.shutdown().await.unwrap();
@@ -937,7 +1062,7 @@ mod tests {
         .await
         .expect("normal relay must not deadlock");
 
-        let reusable = result.expect("relay_response should succeed");
+        let (reusable, _status) = result.expect("relay_response should succeed");
         assert!(reusable, "Content-Length response should be reusable");
 
         client_write.shutdown().await.unwrap();
@@ -965,7 +1090,7 @@ mod tests {
         .await
         .expect("relay must not deadlock");
 
-        let reusable = result.expect("relay_response should succeed");
+        let (reusable, _status) = result.expect("relay_response should succeed");
         // With explicit framing, Connection: close is still reported as reusable
         // so the relay loop continues.  The *next* upstream write will fail and
         // exit the loop via the normal error path.
