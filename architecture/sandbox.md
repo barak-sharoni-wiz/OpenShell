@@ -24,7 +24,7 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `sandbox/mod.rs` | Platform abstraction -- dispatches to Linux or no-op |
 | `sandbox/linux/mod.rs` | Linux composition: Landlock then seccomp |
 | `sandbox/linux/landlock.rs` | Filesystem isolation via Landlock LSM (ABI V1) |
-| `sandbox/linux/seccomp.rs` | Syscall filtering via BPF on `SYS_socket` |
+| `sandbox/linux/seccomp.rs` | Syscall filtering via BPF: socket domain blocks, dangerous syscall blocks, conditional flag blocks |
 | `bypass_monitor.rs` | Background `/dev/kmsg` reader for iptables bypass detection events |
 | `sandbox/linux/netns.rs` | Network namespace creation, veth pair setup, bypass detection iptables rules, cleanup on drop |
 | `l7/mod.rs` | L7 types (`L7Protocol`, `TlsMode`, `EnforcementMode`, `L7EndpointConfig`), config parsing, validation, access preset expansion, deprecated `tls` value handling |
@@ -33,6 +33,7 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation, credential-injection-only passthrough relay |
 | `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing (Content-Length, chunked), deny response generation |
 | `l7/provider.rs` | `L7Provider` trait and `L7Request`/`BodyLength` types |
+| `secrets.rs` | `SecretResolver` credential placeholder system — placeholder generation, multi-location rewriting (headers, query params, path segments, Basic auth), fail-closed scanning, secret validation, percent-encoding |
 
 ## Startup and Orchestration
 
@@ -431,26 +432,26 @@ Landlock restricts the child process's filesystem access to an explicit allowlis
 1. Build path lists from `filesystem.read_only` and `filesystem.read_write`
 2. If `include_workdir` is true, add the working directory to `read_write`
 3. If both lists are empty, skip Landlock entirely (no-op)
-4. Create a Landlock ruleset targeting ABI V1:
+4. Create a Landlock ruleset targeting ABI V2:
    - Read-only paths receive `AccessFs::from_read(abi)` rights
    - Read-write paths receive `AccessFs::from_all(abi)` rights
-5. Call `ruleset.restrict_self()` -- this applies to the calling process and all descendants
+5. For each path, attempt `PathFd::new()`. If it fails:
+   - `BestEffort`: Log a warning with the error classification (not found, permission denied, symlink loop, etc.) and skip the path. Continue building the ruleset from remaining valid paths.
+   - `HardRequirement`: Return a fatal error, aborting the sandbox.
+6. If all paths failed (zero rules applied), return an error rather than calling `restrict_self()` on an empty ruleset (which would block all filesystem access)
+7. Call `ruleset.restrict_self()` -- this applies to the calling process and all descendants
 
-Error behavior depends on `LandlockCompatibility`:
+Kernel-level error behavior (e.g., Landlock ABI unavailable) depends on `LandlockCompatibility`:
 - `BestEffort`: Log a warning and continue without filesystem isolation
 - `HardRequirement`: Return a fatal error, aborting the sandbox
+
+**Baseline path filtering**: System-injected baseline paths (e.g., `/app`) are pre-filtered by `enrich_proto_baseline_paths()` / `enrich_sandbox_baseline_paths()` using `Path::exists()` before they reach Landlock. User-specified paths are not pre-filtered -- they are evaluated at Landlock apply time so misconfigurations surface as warnings or errors.
 
 ### Seccomp syscall filtering
 
 **File:** `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`
 
-Seccomp blocks socket creation for specific address families. The filter targets a single syscall (`SYS_socket`) and inspects argument 0 (the domain).
-
-**Always blocked** (regardless of network mode):
-- `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, `AF_VSOCK`
-
-**Additionally blocked in `Block` mode** (no proxy):
-- `AF_INET`, `AF_INET6`
+Seccomp provides three layers of syscall restriction: socket domain blocks, unconditional syscall blocks, and conditional syscall blocks. The filter uses a default-allow policy (`SeccompAction::Allow`) with targeted rules that return `Errno(EPERM)`.
 
 **Skipped entirely** in `Allow` mode.
 
@@ -458,7 +459,43 @@ Setup:
 1. `prctl(PR_SET_NO_NEW_PRIVS, 1)` -- required before seccomp
 2. `seccompiler::apply_filter()` with default action `Allow` and per-rule action `Errno(EPERM)`
 
+#### Socket domain blocks
+
+| Domain | Always blocked | Additionally blocked in Block mode |
+|--------|:-:|:-:|
+| `AF_PACKET` | Yes | |
+| `AF_BLUETOOTH` | Yes | |
+| `AF_VSOCK` | Yes | |
+| `AF_INET` | | Yes |
+| `AF_INET6` | | Yes |
+| `AF_NETLINK` | | Yes |
+
 In `Proxy` mode, `AF_INET`/`AF_INET6` are allowed because the sandboxed process needs to connect to the proxy over the veth pair. The network namespace ensures it can only reach the proxy's IP (`10.200.0.1`).
+
+#### Unconditional syscall blocks
+
+These syscalls are blocked entirely (EPERM for any invocation):
+
+| Syscall | Reason |
+|---------|--------|
+| `memfd_create` | Fileless binary execution bypasses Landlock filesystem restrictions |
+| `ptrace` | Cross-process memory inspection and code injection |
+| `bpf` | Kernel BPF program loading |
+| `process_vm_readv` | Cross-process memory read |
+| `io_uring_setup` | Async I/O subsystem with extensive CVE history |
+| `mount` | Filesystem mount could subvert Landlock or overlay writable paths |
+
+#### Conditional syscall blocks
+
+These syscalls are only blocked when specific flag patterns are present:
+
+| Syscall | Condition | Reason |
+|---------|-----------|--------|
+| `execveat` | `AT_EMPTY_PATH` flag set (arg4) | Fileless execution from an anonymous fd |
+| `unshare` | `CLONE_NEWUSER` flag set (arg0) | User namespace creation enables privilege escalation |
+| `seccomp` | operation == `SECCOMP_SET_MODE_FILTER` (arg0) | Prevents sandboxed code from replacing the active filter |
+
+Conditional blocks use `MaskedEq` for flag checks (bit-test) and `Eq` for exact-value matches. This allows normal use of these syscalls while blocking the dangerous flag combinations.
 
 ### Network namespace isolation
 
@@ -766,6 +803,8 @@ Every CONNECT request to a non-`inference.local` target produces an `info!()` lo
 
 After OPA allows a connection, the proxy resolves DNS and rejects any host that resolves to an internal IP address (loopback, RFC 1918 private, link-local, or IPv4-mapped IPv6 equivalents). This defense-in-depth measure prevents SSRF attacks where an allowed hostname is pointed at internal infrastructure. The check is implemented by `resolve_and_reject_internal()` which calls `tokio::net::lookup_host()` and validates every resolved address via `is_internal_ip()`. If any resolved IP is internal, the connection receives a `403 Forbidden` response and a warning is logged. See [SSRF Protection](security-policy.md#ssrf-protection-internal-ip-rejection) for the full list of blocked ranges.
 
+IP classification helpers (`is_always_blocked_ip`, `is_always_blocked_net`, `is_internal_ip`) are shared from `openshell_core::net`. The `parse_allowed_ips` function rejects entries overlapping always-blocked ranges (loopback, link-local, unspecified) at load time with a hard error, and `implicit_allowed_ips_for_ip_host` skips synthesis for always-blocked literal IP hosts. The mechanistic mapper filters proposals for always-blocked destinations to prevent infinite TUI notification loops.
+
 ### Inference interception
 
 When a CONNECT target is `inference.local`, the proxy TLS-terminates the client side and inspects the HTTP traffic to detect inference API calls. Matched requests are executed locally via the `openshell-router` crate. The function `handle_inference_interception()` implements this path and returns an `InferenceOutcome`:
@@ -818,11 +857,13 @@ When `Router::proxy_with_candidates()` returns an error, `router_error_to_http()
 
 | `RouterError` variant | HTTP status | Response body |
 |----------------------|-------------|---------------|
-| `RouteNotFound(hint)` | `400` | `no route configured for route '{hint}'` |
-| `NoCompatibleRoute(protocol)` | `400` | `no compatible route for source protocol '{protocol}'` |
-| `Unauthorized(msg)` | `401` | `{msg}` |
-| `UpstreamUnavailable(msg)` | `503` | `{msg}` |
-| `UpstreamProtocol(msg)` / `Internal(msg)` | `502` | `{msg}` |
+| `RouteNotFound(_)` | `400` | `no inference route configured` |
+| `NoCompatibleRoute(_)` | `400` | `no compatible inference route available` |
+| `Unauthorized(_)` | `401` | `unauthorized` |
+| `UpstreamUnavailable(_)` | `503` | `inference service unavailable` |
+| `UpstreamProtocol(_)` / `Internal(_)` | `502` | `inference service error` |
+
+Response messages are generic — internal details (upstream URLs, hostnames, TLS errors, route hints) are never exposed to the sandboxed process. Full error context is logged server-side at `warn` level.
 
 ### Inference routing context
 
@@ -962,7 +1003,7 @@ flowchart LR
 | `EnforcementMode` | `Audit`, `Enforce` | What to do on L7 deny (log-only vs block) |
 | `L7EndpointConfig` | `{ protocol, tls, enforcement }` | Per-endpoint L7 configuration |
 | `L7Decision` | `{ allowed, reason, matched_rule }` | Result of L7 evaluation |
-| `L7RequestInfo` | `{ action, target }` | HTTP method + path for policy evaluation |
+| `L7RequestInfo` | `{ action, target, query_params }` | HTTP method, path, and decoded query multimap for policy evaluation |
 
 ### Access presets
 
@@ -1021,19 +1062,130 @@ TLS termination is automatic. The proxy peeks the first bytes of every CONNECT t
 
 System CA bundles are searched at well-known paths: `/etc/ssl/certs/ca-certificates.crt` (Debian/Ubuntu), `/etc/pki/tls/certs/ca-bundle.crt` (RHEL), `/etc/ssl/ca-bundle.pem` (openSUSE), `/etc/ssl/cert.pem` (Alpine/macOS).
 
-### Credential-injection-only relay
+### Credential injection
+
+**Files:** `crates/openshell-sandbox/src/secrets.rs`, `crates/openshell-sandbox/src/l7/relay.rs`, `crates/openshell-sandbox/src/l7/rest.rs`, `crates/openshell-sandbox/src/proxy.rs`
+
+The sandbox proxy resolves `openshell:resolve:env:*` credential placeholders in outbound HTTP requests. The `SecretResolver` holds a supervisor-only map from placeholder strings to real secret values, constructed at startup from the provider environment. Child processes only see placeholder values in their environment; the proxy rewrites them to real secrets immediately before forwarding upstream.
+
+#### `SecretResolver`
+
+```rust
+pub(crate) struct SecretResolver {
+    by_placeholder: HashMap<String, String>,
+}
+```
+
+`SecretResolver::from_provider_env()` splits the provider environment into two maps: a child-visible map with placeholder values (`openshell:resolve:env:ANTHROPIC_API_KEY`) and a supervisor-only resolver map (`{"openshell:resolve:env:ANTHROPIC_API_KEY": "sk-real-key"}`). The placeholder grammar is `openshell:resolve:env:[A-Za-z_][A-Za-z0-9_]*`.
+
+#### Credential placement locations
+
+The resolver rewrites placeholders in four locations within HTTP requests:
+
+| Location | Example | Encoding | Implementation |
+|----------|---------|----------|----------------|
+| Header value (exact) | `x-api-key: openshell:resolve:env:KEY` | None (raw replacement) | `rewrite_header_value()` |
+| Header value (prefixed) | `Authorization: Bearer openshell:resolve:env:KEY` | None (prefix preserved) | `rewrite_header_value()` |
+| Basic auth token | `Authorization: Basic <base64(user:openshell:resolve:env:PASS)>` | Base64 decode → resolve → re-encode | `rewrite_basic_auth_token()` |
+| URL query parameter | `?key=openshell:resolve:env:KEY` | Percent-decode → resolve → percent-encode (RFC 3986 unreserved) | `rewrite_uri_query_params()` |
+| URL path segment | `/bot<placeholder>/sendMessage` | Percent-decode → resolve → validate → percent-encode (RFC 3986 pchar) | `rewrite_uri_path()` → `rewrite_path_segment()` |
+
+**Header values**: Direct match replaces the entire value. Prefixed match (e.g., `Bearer <placeholder>`) splits on whitespace, resolves the placeholder portion, and reassembles. Basic auth match detects `Authorization: Basic <base64>`, decodes the Base64 content, resolves any placeholders in the decoded `user:password` string, and re-encodes.
+
+**Query parameters**: Each `key=value` pair is checked. Values are percent-decoded before resolution and percent-encoded after (RFC 3986 Section 2.3 unreserved characters preserved: `ALPHA / DIGIT / "-" / "." / "_" / "~"`).
+
+**Path segments**: Handles substring matching for APIs that embed tokens within path segments (e.g., Telegram's `/bot{TOKEN}/sendMessage`). Each segment is percent-decoded, scanned for placeholder boundaries using the env var key grammar (`[A-Za-z_][A-Za-z0-9_]*`), resolved, validated for path safety, and percent-encoded per RFC 3986 Section 3.3 pchar rules (`unreserved / sub-delims / ":" / "@"`).
+
+#### Path credential validation (CWE-22)
+
+Resolved credential values destined for URL path segments are validated by `validate_credential_for_path()` before insertion. The following values are rejected:
+
+| Pattern | Rejection reason |
+|---------|-----------------|
+| `../`, `..\\`, `..` | Path traversal sequence |
+| `/`, `\` | Path separator |
+| `\0`, `\r`, `\n` | Control character |
+| `?`, `#` | URI delimiter |
+
+Rejection causes the request to fail closed (HTTP 500).
+
+#### Secret value validation (CWE-113)
+
+All resolved credential values are validated at the `resolve_placeholder()` level for prohibited control characters: CR (`\r`), LF (`\n`), and null byte (`\0`). This prevents HTTP header injection via malicious credential values. The validation applies to all placement locations automatically — header values, query parameters, and path segments all pass through `resolve_placeholder()`.
+
+#### Fail-closed behavior
+
+All placeholder rewriting fails closed. If any `openshell:resolve:env:*` placeholder is detected in the request but cannot be resolved, the proxy rejects the request with HTTP 500 instead of forwarding the raw placeholder to the upstream. The fail-closed mechanism operates at two levels:
+
+1. **Per-location**: Each rewrite function (`rewrite_uri_query_params`, `rewrite_path_segment`, `rewrite_header_line`) returns an `UnresolvedPlaceholderError` when a placeholder is detected but the resolver has no mapping for it.
+
+2. **Final scan**: After all rewriting completes, `rewrite_http_header_block()` scans the output for any remaining `openshell:resolve:env:` tokens. It also checks the percent-decoded form of the request line to catch encoded placeholder bypass attempts (e.g., `openshell%3Aresolve%3Aenv%3AUNKNOWN`).
+
+```rust
+pub(crate) struct UnresolvedPlaceholderError {
+    pub location: &'static str, // "header", "query_param", "path"
+}
+```
+
+#### Rewrite-before-OPA with redaction
+
+When L7 inspection is active, credential placeholders in the request target (path + query) are resolved BEFORE OPA L7 policy evaluation. This is implemented in `relay_with_inspection()` and `relay_passthrough_with_credentials()` in `l7/relay.rs`:
+
+1. `rewrite_target_for_eval()` resolves the request target, producing two strings:
+   - **Resolved**: real secrets inserted — used only for the upstream connection
+   - **Redacted**: `[CREDENTIAL]` markers in place of secrets — used for OPA input and logs
+
+2. OPA `evaluate_l7_request()` receives the redacted path in `request.path`, so policy rules never see real credential values.
+
+3. All log statements (`L7_REQUEST`, `HTTP_REQUEST`) use the redacted target. Real credential values never appear in logs.
+
+4. The resolved path (with real secrets) goes only to the upstream via `relay_http_request_with_resolver()`.
+
+```rust
+pub(crate) struct RewriteTargetResult {
+    pub resolved: String,  // for upstream forwarding only
+    pub redacted: String,  // for OPA + logs
+}
+```
+
+If credential resolution fails on the request target, the relay returns HTTP 500 and closes the connection.
+
+#### Credential-injection-only relay
 
 **File:** `crates/openshell-sandbox/src/l7/relay.rs` (`relay_passthrough_with_credentials()`)
 
-When TLS is auto-terminated but no L7 policy (`protocol` + `access`/`rules`) is configured on the endpoint, the proxy enters a passthrough mode that still provides value: it parses HTTP requests minimally to rewrite credential placeholders (via `SecretResolver`) and logs each request for observability. This relay:
+When TLS is auto-terminated but no L7 policy (`protocol` + `access`/`rules`) is configured on the endpoint, the proxy enters a passthrough mode that still provides credential injection and observability. This relay:
 
 1. Reads each HTTP request from the client via `RestProvider::parse_request()`
-2. Logs the request method, path, host, and port at `info!()` level (tagged `"HTTP relay (credential injection)"`)
-3. Forwards the request to upstream via `relay_http_request_with_resolver()`, which rewrites headers containing `openshell:resolve:env:*` placeholders with actual provider credential values
-4. Relays the upstream response back to the client
-5. Loops for HTTP keep-alive; exits on client close or non-reusable response
+2. Resolves and redacts the request target via `rewrite_target_for_eval()` (for log safety)
+3. Logs the request method, redacted path, host, and port at `info!()` level (tagged `HTTP_REQUEST`)
+4. Forwards the request to upstream via `relay_http_request_with_resolver()`, which rewrites all credential placeholders in headers, query parameters, path segments, and Basic auth tokens
+5. Relays the upstream response back to the client
+6. Loops for HTTP keep-alive; exits on client close or non-reusable response
 
 This enables credential injection on all HTTPS endpoints automatically, without requiring the policy author to add `protocol: rest` and `access: full` just to get credentials injected.
+
+#### Known limitation: host-binding
+
+The resolver resolves all placeholders regardless of destination host. If an agent has OPA-allowed access to an attacker-controlled host, it could construct a URL containing a placeholder and exfiltrate the resolved credential value to that host. OPA host restrictions are the defense — only endpoints explicitly allowed by policy receive traffic. Per-credential host binding (restricting which credentials resolve for which destination hosts) is not implemented.
+
+#### Data flow
+
+```mermaid
+sequenceDiagram
+    participant A as Agent Process
+    participant P as Proxy (SecretResolver)
+    participant O as OPA Engine
+    participant U as Upstream API
+
+    A->>P: GET /bot<placeholder>/send?key=<placeholder> HTTP/1.1<br/>Authorization: Bearer <placeholder>
+    P->>P: rewrite_target_for_eval(target)<br/>→ resolved: /bot{secret}/send?key={secret}<br/>→ redacted: /bot[CREDENTIAL]/send?key=[CREDENTIAL]
+    P->>O: evaluate_l7_request(redacted path)
+    O-->>P: allow
+    P->>P: rewrite_http_header_block(headers)<br/>→ resolve header placeholders<br/>→ resolve query param placeholders<br/>→ resolve path segment placeholders<br/>→ fail-closed scan
+    P->>U: GET /bot{secret}/send?key={secret} HTTP/1.1<br/>Authorization: Bearer {secret}
+    Note over P: Logs use redacted path only
+```
 
 ### REST protocol provider
 
@@ -1041,7 +1193,7 @@ This enables credential injection on all HTTPS endpoints automatically, without 
 
 Implements `L7Provider` for HTTP/1.1:
 
-- **`parse_request()`**: Reads up to 16 KiB of headers, parses the request line (method, path), determines body framing from `Content-Length` or `Transfer-Encoding: chunked` headers. Returns `L7Request` with raw header bytes (may include overflow body bytes).
+- **`parse_request()`**: Reads up to 16 KiB of headers, parses the request line (method, path), decodes query parameters into a multimap, determines body framing from `Content-Length` or `Transfer-Encoding: chunked` headers. Returns `L7Request` with raw header bytes (may include overflow body bytes).
 
 - **`relay()`**: Forwards request headers and body to upstream (handling Content-Length, chunked, and no-body cases), then reads and relays the full response back to the client.
 
@@ -1054,11 +1206,12 @@ Implements `L7Provider` for HTTP/1.1:
 `relay_with_inspection()` in `crates/openshell-sandbox/src/l7/relay.rs` is the main relay loop:
 
 1. Parse one HTTP request from client via the provider
-2. Build L7 input JSON with `request.method`, `request.path`, plus the CONNECT-level context (host, port, binary, ancestors, cmdline)
-3. Evaluate `data.openshell.sandbox.allow_request` and `data.openshell.sandbox.request_deny_reason`
-4. Log the L7 decision (tagged `L7_REQUEST`)
-5. If allowed (or audit mode): relay request to upstream and response back to client, then loop
-6. If denied in enforce mode: send 403 and close the connection
+2. Resolve credential placeholders in the request target via `rewrite_target_for_eval()`. OPA receives the redacted path (`[CREDENTIAL]` markers); the resolved path goes only to upstream. If resolution fails, return HTTP 500 and close the connection.
+3. Build L7 input JSON with `request.method`, the **redacted** `request.path`, `request.query_params`, plus the CONNECT-level context (host, port, binary, ancestors, cmdline)
+4. Evaluate `data.openshell.sandbox.allow_request` and `data.openshell.sandbox.request_deny_reason`
+5. Log the L7 decision (tagged `L7_REQUEST`) using the redacted target — real credential values never appear in logs
+6. If allowed (or audit mode): relay request to upstream via `relay_http_request_with_resolver()` (which rewrites all remaining credential placeholders in headers, query parameters, path segments, and Basic auth tokens) and relay the response back to client, then loop
+7. If denied in enforce mode: send 403 (using redacted target in the response body) and close the connection
 
 ## Process Identity
 
@@ -1311,6 +1464,10 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | Log push gRPC stream breaks | Push loop exits, flushes remaining batch |
 | Proxy accept error | Log + break accept loop |
 | Benign connection close (EOF, reset, pipe) | Debug level (not visible to user by default) |
+| Credential injection: unresolved placeholder detected | HTTP 500, connection closed (fail-closed) |
+| Credential injection: resolved value contains CR/LF/null | Placeholder treated as unresolvable, fail-closed |
+| Credential injection: path credential contains traversal/separator | HTTP 500, connection closed (fail-closed) |
+| Credential injection: percent-encoded placeholder bypass attempt | HTTP 500, connection closed (fail-closed) |
 | L7 parse error | Close the connection |
 | SSH server failure | Async task error logged, main process unaffected |
 | Process timeout | Kill process, return exit code 124 |

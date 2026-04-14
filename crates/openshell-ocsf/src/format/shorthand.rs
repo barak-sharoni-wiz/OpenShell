@@ -6,6 +6,7 @@
 //! Pattern: `<HH:MM:SS.mmm> <severity> <CLASS:ACTIVITY> <action> <key fields> [context]`
 
 use crate::events::OcsfEvent;
+use crate::events::base_event::BaseEventData;
 use crate::objects::Url;
 
 /// Format a timestamp (ms since epoch) as `HH:MM:SS.mmm`.
@@ -36,6 +37,50 @@ pub fn severity_char(severity_id: u8) -> char {
     }
 }
 
+/// Format the severity as a bracketed tag placed after the `CLASS:ACTIVITY`.
+///
+/// Placed as a suffix so the class name always starts at column 0, keeping
+/// logs vertically scannable:
+///
+/// ```text
+/// NET:OPEN [INFO] ALLOWED python3(42) -> api.example.com:443
+/// NET:OPEN [MED] DENIED python3(42) -> blocked.com:443
+/// FINDING:BLOCKED [HIGH] "NSSH1 Nonce Replay Attack"
+/// ```
+#[must_use]
+pub fn severity_tag(severity_id: u8) -> &'static str {
+    match severity_id {
+        1 => "[INFO]",
+        2 => "[LOW]",
+        3 => "[MED]",
+        4 => "[HIGH]",
+        5 => "[CRIT]",
+        6 => "[FATAL]",
+        _ => "[INFO]",
+    }
+}
+
+/// Max length for the reason text in `[reason:...]` before truncation.
+const MAX_REASON_LEN: usize = 80;
+
+/// Format a `[reason:...]` tag from `status_detail` (or `message` fallback)
+/// for denied events.  Returns an empty string if neither field is set.
+fn reason_tag(base: &BaseEventData) -> String {
+    let text = base
+        .status_detail
+        .as_deref()
+        .or(base.message.as_deref())
+        .unwrap_or("");
+    if text.is_empty() {
+        return String::new();
+    }
+    if text.len() > MAX_REASON_LEN {
+        format!(" [reason:{}...]", &text[..MAX_REASON_LEN])
+    } else {
+        format!(" [reason:{text}]")
+    }
+}
+
 impl OcsfEvent {
     /// Produce the single-line shorthand for `openshell.log` and gRPC log push.
     ///
@@ -43,8 +88,7 @@ impl OcsfEvent {
     #[must_use]
     pub fn format_shorthand(&self) -> String {
         let base = self.base();
-        let ts = format_ts(base.time);
-        let sev = severity_char(base.severity.as_u8());
+        let sev = severity_tag(base.severity.as_u8());
 
         match self {
             Self::NetworkActivity(e) => {
@@ -75,6 +119,12 @@ impl OcsfEvent {
                     .as_ref()
                     .map(|r| format!(" [policy:{} engine:{}]", r.name, r.rule_type))
                     .unwrap_or_default();
+                // For denied events, surface the reason from status_detail
+                let reason_ctx = if action == "DENIED" {
+                    reason_tag(&e.base)
+                } else {
+                    String::new()
+                };
                 let arrow = if actor_str.is_empty() && dst.is_empty() {
                     String::new()
                 } else if actor_str.is_empty() {
@@ -85,7 +135,13 @@ impl OcsfEvent {
                     format!(" {actor_str} -> {dst}")
                 };
 
-                format!("{ts} {sev} NET:{activity} {action}{arrow}{rule_ctx}")
+                let detail = match (action.is_empty(), arrow.is_empty()) {
+                    (true, true) => String::new(),
+                    (true, false) => arrow,
+                    (false, true) => format!(" {action}"),
+                    (false, false) => format!(" {action}{arrow}"),
+                };
+                format!("NET:{activity} {sev}{detail}{rule_ctx}{reason_ctx}")
             }
 
             Self::HttpActivity(e) => {
@@ -108,15 +164,27 @@ impl OcsfEvent {
                 let rule_ctx = e
                     .firewall_rule
                     .as_ref()
-                    .map(|r| format!(" [policy:{}]", r.name))
+                    .map(|r| format!(" [policy:{} engine:{}]", r.name, r.rule_type))
                     .unwrap_or_default();
+                // For denied events, surface the reason from status_detail
+                let reason_ctx = if action == "DENIED" {
+                    reason_tag(&e.base)
+                } else {
+                    String::new()
+                };
                 let arrow = if actor_str.is_empty() {
                     format!(" {method} {url_str}")
                 } else {
                     format!(" {actor_str} -> {method} {url_str}")
                 };
 
-                format!("{ts} {sev} HTTP:{method} {action}{arrow}{rule_ctx}")
+                let detail = match (action.is_empty(), arrow.is_empty()) {
+                    (true, true) => String::new(),
+                    (true, false) => arrow,
+                    (false, true) => format!(" {action}"),
+                    (false, false) => format!(" {action}{arrow}"),
+                };
+                format!("HTTP:{method} {sev}{detail}{rule_ctx}{reason_ctx}")
             }
 
             Self::SshActivity(e) => {
@@ -143,7 +211,21 @@ impl OcsfEvent {
                     })
                     .unwrap_or_default();
 
-                format!("{ts} {sev} SSH:{activity} {action} {peer}{auth_ctx}")
+                let detail = [
+                    if action.is_empty() { "" } else { &action },
+                    if peer.is_empty() { "" } else { &peer },
+                ]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ");
+                let detail = if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {detail}")
+                };
+                format!("SSH:{activity} {sev}{detail}{auth_ctx}")
             }
 
             Self::ProcessActivity(e) => {
@@ -160,7 +242,7 @@ impl OcsfEvent {
                     .map(|c| format!(" [cmd:{c}]"))
                     .unwrap_or_default();
 
-                format!("{ts} {sev} PROC:{activity} {proc_str}{exit_ctx}{cmd_ctx}")
+                format!("PROC:{activity} {sev} {proc_str}{exit_ctx}{cmd_ctx}")
             }
 
             Self::DetectionFinding(e) => {
@@ -173,7 +255,7 @@ impl OcsfEvent {
                     .map(|c| format!(" [confidence:{}]", c.label().to_lowercase()))
                     .unwrap_or_default();
 
-                format!("{ts} {sev} FINDING:{disposition} \"{title}\"{confidence_ctx}")
+                format!("FINDING:{disposition} {sev} \"{title}\"{confidence_ctx}")
             }
 
             Self::ApplicationLifecycle(e) => {
@@ -185,7 +267,7 @@ impl OcsfEvent {
                     .map(|s| s.label().to_lowercase())
                     .unwrap_or_default();
 
-                format!("{ts} {sev} LIFECYCLE:{activity} {app} {status}")
+                format!("LIFECYCLE:{activity} {sev} {app} {status}")
             }
 
             Self::DeviceConfigStateChange(e) => {
@@ -214,7 +296,7 @@ impl OcsfEvent {
                     })
                     .unwrap_or_default();
 
-                format!("{ts} {sev} CONFIG:{state} {what}{version_ctx}")
+                format!("CONFIG:{state} {sev} {what}{version_ctx}")
             }
 
             Self::Base(e) => {
@@ -240,7 +322,7 @@ impl OcsfEvent {
                     })
                     .unwrap_or_default();
 
-                format!("{ts} {sev} EVENT {message}{unmapped_ctx}")
+                format!("EVENT {sev} {message}{unmapped_ctx}")
             }
         }
     }
@@ -337,7 +419,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 I NET:OPEN ALLOWED python3(42) -> api.example.com:443 [policy:default-egress engine:mechanistic]"
+            "NET:OPEN [INFO] ALLOWED python3(42) -> api.example.com:443 [policy:default-egress engine:mechanistic]"
         );
     }
 
@@ -366,7 +448,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 M NET:REFUSE DENIED node(1234) -> 93.184.216.34:443/tcp [policy:bypass-detect engine:iptables]"
+            "NET:REFUSE [MED] DENIED node(1234) -> 93.184.216.34:443/tcp [policy:bypass-detect engine:iptables]"
         );
     }
 
@@ -395,7 +477,171 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 I HTTP:GET ALLOWED curl(88) -> GET https://api.example.com/v1/data [policy:default-egress]"
+            "HTTP:GET [INFO] ALLOWED curl(88) -> GET https://api.example.com/v1/data [policy:default-egress engine:mechanistic]"
+        );
+    }
+
+    #[test]
+    fn test_network_activity_shorthand_denied_shows_reason() {
+        let mut b = base(4001, "Network Activity", 4, "Network Activity", 1, "Open");
+        b.severity = crate::enums::SeverityId::Medium;
+        b.set_status_detail(
+            "169.254.169.254 resolves to always-blocked address 169.254.169.254, connection rejected"
+                .to_string(),
+        );
+
+        let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
+            base: b,
+            src_endpoint: None,
+            dst_endpoint: Some(Endpoint::from_domain("169.254.169.254", 80)),
+            proxy_endpoint: None,
+            actor: Some(Actor {
+                process: Process::new("curl", 1618),
+            }),
+            firewall_rule: Some(FirewallRule::new("-", "ssrf")),
+            connection_info: None,
+            action: Some(ActionId::Denied),
+            disposition: Some(DispositionId::Blocked),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert!(
+            shorthand.contains("[reason:"),
+            "denied shorthand should contain [reason:]: {shorthand}"
+        );
+        assert!(
+            shorthand.contains("always-blocked"),
+            "reason should contain 'always-blocked': {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_network_activity_shorthand_allowed_no_reason() {
+        let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
+            base: base(4001, "Network Activity", 4, "Network Activity", 1, "Open"),
+            src_endpoint: None,
+            dst_endpoint: Some(Endpoint::from_domain("api.example.com", 443)),
+            proxy_endpoint: None,
+            actor: Some(Actor {
+                process: Process::new("python3", 42),
+            }),
+            firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
+            connection_info: None,
+            action: Some(ActionId::Allowed),
+            disposition: Some(DispositionId::Allowed),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert!(
+            !shorthand.contains("[reason:"),
+            "allowed shorthand should NOT contain [reason:]: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_http_activity_shorthand_denied_shows_reason() {
+        let mut b = base(4002, "HTTP Activity", 4, "Network Activity", 99, "Other");
+        b.severity = crate::enums::SeverityId::Medium;
+        b.set_status_detail("not in allowed_ips".to_string());
+
+        let event = OcsfEvent::HttpActivity(HttpActivityEvent {
+            base: b,
+            http_request: Some(HttpRequest::new(
+                "PUT",
+                Url::new("http", "169.254.169.254", "/latest/api/token", 80),
+            )),
+            http_response: None,
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: Some(Actor {
+                process: Process::new("curl", 1618),
+            }),
+            firewall_rule: Some(FirewallRule::new("aws_iam", "ssrf")),
+            action: Some(ActionId::Denied),
+            disposition: Some(DispositionId::Blocked),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert!(
+            shorthand.contains("[reason:not in allowed_ips]"),
+            "denied HTTP shorthand should contain [reason:not in allowed_ips]: {shorthand}"
+        );
+        assert!(
+            shorthand.contains("[policy:aws_iam engine:ssrf]"),
+            "denied HTTP shorthand should contain engine: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_shorthand_reason_truncated_at_80_chars() {
+        let long_reason = "a".repeat(120);
+        let mut b = base(4001, "Network Activity", 4, "Network Activity", 1, "Open");
+        b.severity = crate::enums::SeverityId::Medium;
+        b.set_status_detail(long_reason.clone());
+
+        let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
+            base: b,
+            src_endpoint: None,
+            dst_endpoint: Some(Endpoint::from_domain("example.com", 443)),
+            proxy_endpoint: None,
+            actor: None,
+            firewall_rule: None,
+            connection_info: None,
+            action: Some(ActionId::Denied),
+            disposition: Some(DispositionId::Blocked),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert!(
+            shorthand.contains("[reason:"),
+            "should have reason tag: {shorthand}"
+        );
+        assert!(
+            shorthand.contains("...]"),
+            "long reason should be truncated with ...: {shorthand}"
+        );
+        // The full 120-char reason should not appear
+        assert!(
+            !shorthand.contains(&long_reason),
+            "full reason should not appear: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_http_activity_shorthand_non_default_port() {
+        let event = OcsfEvent::HttpActivity(HttpActivityEvent {
+            base: base(4002, "HTTP Activity", 4, "Network Activity", 3, "Get"),
+            http_request: Some(HttpRequest::new(
+                "GET",
+                Url::new("http", "172.20.0.1", "/test", 9876),
+            )),
+            http_response: None,
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: Some(Actor {
+                process: Process::new("curl", 68),
+            }),
+            firewall_rule: Some(FirewallRule::new("allow_host_9876", "mechanistic")),
+            action: Some(ActionId::Allowed),
+            disposition: None,
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "HTTP:GET [INFO] ALLOWED curl(68) -> GET http://172.20.0.1:9876/test [policy:allow_host_9876 engine:mechanistic]"
         );
     }
 
@@ -416,7 +662,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 I SSH:OPEN ALLOWED 10.42.0.1:48201 [auth:NSSH1]"
+            "SSH:OPEN [INFO] ALLOWED 10.42.0.1:48201 [auth:NSSH1]"
         );
     }
 
@@ -435,7 +681,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 I PROC:LAUNCH python3(42) [cmd:python3 /app/main.py]"
+            "PROC:LAUNCH [INFO] python3(42) [cmd:python3 /app/main.py]"
         );
     }
 
@@ -459,10 +705,7 @@ mod tests {
         });
 
         let shorthand = event.format_shorthand();
-        assert_eq!(
-            shorthand,
-            "14:00:00.000 I PROC:TERMINATE python3(42) [exit:0]"
-        );
+        assert_eq!(shorthand, "PROC:TERMINATE [INFO] python3(42) [exit:0]");
     }
 
     #[test]
@@ -487,7 +730,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 H FINDING:BLOCKED \"NSSH1 Nonce Replay Attack\" [confidence:high]"
+            "FINDING:BLOCKED [HIGH] \"NSSH1 Nonce Replay Attack\" [confidence:high]"
         );
     }
 
@@ -514,7 +757,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 I LIFECYCLE:START openshell-sandbox success"
+            "LIFECYCLE:START [INFO] openshell-sandbox success"
         );
     }
 
@@ -536,7 +779,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 I CONFIG:LOADED policy reloaded [version:v3 hash:sha256:abc123def456]"
+            "CONFIG:LOADED [INFO] policy reloaded [version:v3 hash:sha256:abc123def456]"
         );
     }
 
@@ -551,7 +794,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "14:00:00.000 I EVENT Network namespace created [ns:openshell-sandbox-abc123]"
+            "EVENT [INFO] Network namespace created [ns:openshell-sandbox-abc123]"
         );
     }
 }

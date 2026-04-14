@@ -119,6 +119,28 @@ Project requirements:
 - Rust 1.88+
 - Python 3.12+
 - Docker (running)
+- Z3 solver library (for the policy prover crate)
+
+### Z3 installation
+
+The `openshell-prover` crate links against the system Z3 library via pkg-config.
+
+```bash
+# macOS
+brew install z3
+
+# Ubuntu / Debian
+sudo apt install libz3-dev
+
+# Fedora
+sudo dnf install z3-devel
+```
+
+If you prefer not to install Z3 system-wide, you can compile it from source as a one-time step:
+
+```bash
+cargo build -p openshell-prover --features bundled-z3
+```
 
 ## Getting Started
 
@@ -173,7 +195,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run test`    | Default test suite                                      |
 | `mise run e2e`     | Default end-to-end test lane                            |
 | `mise run ci`      | Full local CI checks (lint, compile/type checks, tests) |
-| `mise run docs`    | Build and serve documentation locally                   |
+| `mise run docs`    | Validate Fern docs locally                              |
 | `mise run clean`   | Clean build artifacts                                   |
 
 ## Project Structure
@@ -185,25 +207,42 @@ These are the primary `mise` tasks for day-to-day development:
 | `proto/`        | Protocol buffer definitions                   |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
+| `docs/`         | Published Fern docs source, navigation, and content assets |
+| `fern/`         | Fern site config, components, and theme assets |
 | `architecture/` | Architecture docs and plans                   |
-| `docs/`         | User-facing documentation (Sphinx/MyST)       |
+| `rfc/`          | Request for Comments proposals                |
 | `.agents/`      | Agent skills and persona definitions          |
+
+## RFCs
+
+For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, use the RFC process. RFCs live in `rfc/` — copy the template, fill it in, and open a PR for discussion. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines on when to write an RFC versus a spike issue or architecture doc.
 
 ## Documentation
 
-If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR.
+If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR and adjust `docs/index.yml` if navigation changes. For explicit navigation entries, keep `page:` aligned with `sidebar-title` when present and put relative `slug:` values in `docs/index.yml`. Reserve frontmatter `slug` for folder-discovered pages or absolute URL overrides.
 
 To ensure your doc changes follow NVIDIA documentation style, use the `update-docs` skill.
-It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `docs/CONTRIBUTING.md`.
+It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `docs/CONTRIBUTING.mdx`.
 
-To build and preview docs locally:
+To preview Fern docs locally:
 
 ```bash
-mise run docs # to build the docs locally
-mise run docs:serve # to serve locally and automatically rebuild on changes
+mise run docs:serve
 ```
 
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for more details.
+To run non-interactive validation:
+
+```bash
+mise run docs
+```
+
+PRs that touch `docs/**` or `fern/**` are validated by `.github/workflows/branch-docs.yml`, and they get a preview when `FERN_TOKEN` is available to the workflow.
+
+Fern docs publishing is handled by the `publish-fern-docs` job in `.github/workflows/release-tag.yml` when a release tag is created.
+
+`docs/` is the source-of-truth docs tree. `fern/` contains the site config, components, and theme assets that publish those pages.
+
+See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authoring guide.
 
 ## Pull Requests
 

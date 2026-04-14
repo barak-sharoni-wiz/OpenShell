@@ -7,12 +7,16 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
-use crate::l7::provider::L7Provider;
+use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
-use crate::secrets::SecretResolver;
+use crate::secrets::{self, SecretResolver};
 use miette::{IntoDiagnostic, Result, miette};
+use openshell_ocsf::{
+    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
+    NetworkActivityBuilder, SeverityId, Url as OcsfUrl, ocsf_emit,
+};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 /// Context for L7 request policy evaluation.
@@ -55,17 +59,61 @@ where
         L7Protocol::Rest => relay_rest(config, &engine, client, upstream, ctx).await,
         L7Protocol::Sql => {
             // SQL provider is Phase 3 — fall through to passthrough with warning
-            warn!(
-                host = %ctx.host,
-                port = ctx.port,
-                "SQL L7 provider not yet implemented, falling back to passthrough"
-            );
+            {
+                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .severity(SeverityId::Low)
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .message("SQL L7 provider not yet implemented, falling back to passthrough")
+                    .build();
+                ocsf_emit!(event);
+            }
             tokio::io::copy_bidirectional(client, upstream)
                 .await
                 .into_diagnostic()?;
             Ok(())
         }
     }
+}
+
+/// Handle an upgraded connection (101 Switching Protocols).
+///
+/// Forwards any overflow bytes from the upgrade response to the client, then
+/// switches to raw bidirectional TCP copy for the upgraded protocol (WebSocket,
+/// HTTP/2, etc.). L7 policy enforcement does not apply after the upgrade —
+/// the initial HTTP request was already evaluated.
+async fn handle_upgrade<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    overflow: Vec<u8>,
+    host: &str,
+    port: u16,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    ocsf_emit!(
+        NetworkActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Other)
+            .activity_name("Upgrade")
+            .severity(SeverityId::Informational)
+            .dst_endpoint(Endpoint::from_domain(host, port))
+            .message(format!(
+                "101 Switching Protocols — raw bidirectional relay (L7 enforcement no longer active) \
+                 [host:{host} port:{port} overflow_bytes:{}]",
+                overflow.len()
+            ))
+            .build()
+    );
+    if !overflow.is_empty() {
+        client.write_all(&overflow).await.into_diagnostic()?;
+        client.flush().await.into_diagnostic()?;
+    }
+    tokio::io::copy_bidirectional(client, upstream)
+        .await
+        .into_diagnostic()?;
+    Ok(())
 }
 
 /// REST relay loop: parse request -> evaluate -> allow/deny -> relay response -> repeat.
@@ -94,65 +142,146 @@ where
                         "L7 connection closed"
                     );
                 } else {
-                    warn!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        error = %e,
-                        "HTTP parse error in L7 relay"
-                    );
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                        .message(format!("HTTP parse error in L7 relay: {e}"))
+                        .build();
+                    ocsf_emit!(event);
                 }
                 return Ok(()); // Close connection on parse error
             }
         };
 
+        // Rewrite credential placeholders in the request target BEFORE OPA
+        // evaluation. OPA sees the redacted path; the resolved path goes only
+        // to the upstream write.
+        let (eval_target, redacted_target) = if let Some(ref resolver) = ctx.secret_resolver {
+            match secrets::rewrite_target_for_eval(&req.target, resolver) {
+                Ok(result) => (result.resolved, result.redacted),
+                Err(e) => {
+                    warn!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "credential resolution failed in request target, rejecting"
+                    );
+                    let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    client.write_all(response).await.into_diagnostic()?;
+                    client.flush().await.into_diagnostic()?;
+                    return Ok(());
+                }
+            }
+        } else {
+            (req.target.clone(), req.target.clone())
+        };
+
         let request_info = L7RequestInfo {
             action: req.action.clone(),
-            target: req.target.clone(),
+            target: redacted_target.clone(),
+            query_params: req.query_params.clone(),
         };
 
-        // Evaluate L7 policy via Rego
+        // Evaluate L7 policy via Rego (using redacted target)
         let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
 
-        let decision_str = match (allowed, config.enforcement) {
-            (true, _) => "allow",
-            (false, EnforcementMode::Audit) => "audit",
-            (false, EnforcementMode::Enforce) => "deny",
+        // Check if this is an upgrade request for logging purposes.
+        let header_end = req
+            .raw_header
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map_or(req.raw_header.len(), |p| p + 4);
+        let is_upgrade_request = {
+            let h = String::from_utf8_lossy(&req.raw_header[..header_end]);
+            h.lines()
+                .skip(1)
+                .any(|l| l.to_ascii_lowercase().starts_with("upgrade:"))
         };
 
-        // Log every L7 decision
-        info!(
-            dst_host = %ctx.host,
-            dst_port = ctx.port,
-            policy = %ctx.policy_name,
-            l7_protocol = "rest",
-            l7_action = %request_info.action,
-            l7_target = %request_info.target,
-            l7_decision = decision_str,
-            l7_deny_reason = %reason,
-            "L7_REQUEST",
-        );
+        let decision_str = match (allowed, config.enforcement, is_upgrade_request) {
+            (true, _, true) => "allow_upgrade",
+            (true, _, false) => "allow",
+            (false, EnforcementMode::Audit, _) => "audit",
+            (false, EnforcementMode::Enforce, _) => "deny",
+        };
+
+        // Log every L7 decision as an OCSF HTTP Activity event.
+        // Uses redacted_target (path only, no query params) to avoid logging secrets.
+        {
+            let (action_id, disposition_id, severity) = match decision_str {
+                "allow" => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Informational,
+                ),
+                "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
+                "audit" => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Informational,
+                ),
+                _ => (
+                    ActionId::Other,
+                    DispositionId::Other,
+                    SeverityId::Informational,
+                ),
+            };
+            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Other)
+                .action(action_id)
+                .disposition(disposition_id)
+                .severity(severity)
+                .http_request(HttpRequest::new(
+                    &request_info.action,
+                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .firewall_rule(&ctx.policy_name, "l7")
+                .message(format!(
+                    "L7_REQUEST {decision_str} {} {}:{}{} reason={}",
+                    request_info.action, ctx.host, ctx.port, redacted_target, reason,
+                ))
+                .build();
+            ocsf_emit!(event);
+        }
+
+        // Store the resolved target for the deny response redaction
+        let _ = &eval_target;
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             // Forward request to upstream and relay response
-            let reusable = crate::l7::rest::relay_http_request_with_resolver(
+            let outcome = crate::l7::rest::relay_http_request_with_resolver(
                 &req,
                 client,
                 upstream,
                 ctx.secret_resolver.as_deref(),
             )
             .await?;
-            if !reusable {
-                debug!(
-                    host = %ctx.host,
-                    port = ctx.port,
-                    "Upstream connection not reusable, closing L7 relay"
-                );
-                return Ok(());
+            match outcome {
+                RelayOutcome::Reusable => {} // continue loop
+                RelayOutcome::Consumed => {
+                    debug!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        "Upstream connection not reusable, closing L7 relay"
+                    );
+                    return Ok(());
+                }
+                RelayOutcome::Upgraded { overflow } => {
+                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                }
             }
         } else {
-            // Enforce mode: deny with 403 and close connection
+            // Enforce mode: deny with 403 and close connection (use redacted target)
             crate::l7::rest::RestProvider
-                .deny(&req, &ctx.policy_name, &reason, client)
+                .deny_with_redacted_target(
+                    &req,
+                    &ctx.policy_name,
+                    &reason,
+                    client,
+                    Some(&redacted_target),
+                )
                 .await?;
             return Ok(());
         }
@@ -180,7 +309,7 @@ fn is_benign_connection_error(err: &miette::Report) -> bool {
 /// Evaluate an L7 request against the OPA engine.
 ///
 /// Returns `(allowed, deny_reason)`.
-fn evaluate_l7_request(
+pub fn evaluate_l7_request(
     engine: &Mutex<regorus::Engine>,
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
@@ -198,6 +327,7 @@ fn evaluate_l7_request(
         "request": {
             "method": request.action,
             "path": request.target,
+            "query_params": request.query_params.clone(),
         }
     });
 
@@ -263,27 +393,62 @@ where
 
         request_count += 1;
 
-        // Log for observability.
+        // Resolve and redact the target for logging.
+        let redacted_target = if let Some(ref res) = ctx.secret_resolver {
+            match secrets::rewrite_target_for_eval(&req.target, res) {
+                Ok(result) => result.redacted,
+                Err(e) => {
+                    warn!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "credential resolution failed in request target, rejecting"
+                    );
+                    let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    client.write_all(response).await.into_diagnostic()?;
+                    client.flush().await.into_diagnostic()?;
+                    return Ok(());
+                }
+            }
+        } else {
+            req.target.clone()
+        };
+
+        // Log for observability via OCSF HTTP Activity event.
+        // Uses redacted_target (path only, no query params) to avoid logging secrets.
         let has_creds = resolver.is_some();
-        info!(
-            host = %ctx.host,
-            port = ctx.port,
-            method = %req.action,
-            path = %req.target,
-            credentials_injected = has_creds,
-            request_num = request_count,
-            "HTTP_REQUEST",
-        );
+        {
+            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Other)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .http_request(HttpRequest::new(
+                    &req.action,
+                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .message(format!(
+                    "HTTP_REQUEST {} {}:{}{} credentials_injected={has_creds} request_num={request_count}",
+                    req.action, ctx.host, ctx.port, redacted_target,
+                ))
+                .build();
+            ocsf_emit!(event);
+        }
 
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
         // the request upstream and reads the response back to the client.
-        let reusable =
+        let outcome =
             crate::l7::rest::relay_http_request_with_resolver(&req, client, upstream, resolver)
                 .await?;
 
-        if !reusable {
-            break;
+        match outcome {
+            RelayOutcome::Reusable => {} // continue loop
+            RelayOutcome::Consumed => break,
+            RelayOutcome::Upgraded { overflow } => {
+                return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+            }
         }
     }
 

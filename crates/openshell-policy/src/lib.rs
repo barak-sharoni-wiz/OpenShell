@@ -15,8 +15,8 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    FilesystemPolicy, L7Allow, L7Rule, LandlockPolicy, NetworkBinary, NetworkEndpoint,
-    NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    FilesystemPolicy, L7Allow, L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary,
+    NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -82,11 +82,12 @@ struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     host: String,
     /// Single port (backwards compat). Mutually exclusive with `ports`.
+    /// Uses `u16` to reject invalid values >65535 at parse time.
     #[serde(default, skip_serializing_if = "is_zero")]
-    port: u32,
+    port: u16,
     /// Multiple ports. When non-empty, this endpoint covers all listed ports.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    ports: Vec<u32>,
+    ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     protocol: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -101,7 +102,7 @@ struct NetworkEndpointDef {
     allowed_ips: Vec<String>,
 }
 
-fn is_zero(v: &u32) -> bool {
+fn is_zero(v: &u16) -> bool {
     *v == 0
 }
 
@@ -120,6 +121,22 @@ struct L7AllowDef {
     path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     command: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    query: BTreeMap<String, QueryMatcherDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum QueryMatcherDef {
+    Glob(String),
+    Any(QueryAnyDef),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryAnyDef {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    any: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -153,10 +170,10 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                     .map(|e| {
                         // Normalize port/ports: ports takes precedence, else
                         // single port is promoted to ports array.
-                        let normalized_ports = if !e.ports.is_empty() {
-                            e.ports
+                        let normalized_ports: Vec<u32> = if !e.ports.is_empty() {
+                            e.ports.into_iter().map(u32::from).collect()
                         } else if e.port > 0 {
-                            vec![e.port]
+                            vec![u32::from(e.port)]
                         } else {
                             vec![]
                         };
@@ -176,6 +193,23 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                         method: r.allow.method,
                                         path: r.allow.path,
                                         command: r.allow.command,
+                                        query: r
+                                            .allow
+                                            .query
+                                            .into_iter()
+                                            .map(|(key, matcher)| {
+                                                let proto = match matcher {
+                                                    QueryMatcherDef::Glob(glob) => {
+                                                        L7QueryMatcher { glob, any: vec![] }
+                                                    }
+                                                    QueryMatcherDef::Any(any) => L7QueryMatcher {
+                                                        glob: String::new(),
+                                                        any: any.any,
+                                                    },
+                                                };
+                                                (key, proto)
+                                            })
+                                            .collect(),
                                     }),
                                 })
                                 .collect(),
@@ -252,10 +286,12 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                     .map(|e| {
                         // Use compact form: if ports has exactly 1 element,
                         // emit port (scalar). If >1, emit ports (array).
+                        // Proto uses u32; YAML uses u16. Clamp at boundary.
+                        let clamp = |v: u32| -> u16 { v.min(65535) as u16 };
                         let (port, ports) = if e.ports.len() > 1 {
-                            (0, e.ports.clone())
+                            (0, e.ports.iter().map(|&p| clamp(p)).collect())
                         } else {
-                            (e.ports.first().copied().unwrap_or(e.port), vec![])
+                            (clamp(e.ports.first().copied().unwrap_or(e.port)), vec![])
                         };
                         NetworkEndpointDef {
                             host: e.host.clone(),
@@ -275,6 +311,20 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                             method: a.method,
                                             path: a.path,
                                             command: a.command,
+                                            query: a
+                                                .query
+                                                .into_iter()
+                                                .map(|(key, matcher)| {
+                                                    let yaml_matcher = if !matcher.any.is_empty() {
+                                                        QueryMatcherDef::Any(QueryAnyDef {
+                                                            any: matcher.any,
+                                                        })
+                                                    } else {
+                                                        QueryMatcherDef::Glob(matcher.glob)
+                                                    };
+                                                    (key, yaml_matcher)
+                                                })
+                                                .collect(),
                                         },
                                     }
                                 })
@@ -311,7 +361,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
 
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
-    let raw: PolicyFile = serde_yaml::from_str(yaml)
+    let raw: PolicyFile = serde_yml::from_str(yaml)
         .into_diagnostic()
         .wrap_err("failed to parse sandbox policy YAML")?;
     Ok(to_proto(raw))
@@ -324,7 +374,7 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
 /// and is round-trippable through `parse_sandbox_policy`.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
     let yaml_repr = from_proto(policy);
-    serde_yaml::to_string(&yaml_repr)
+    serde_yml::to_string(&yaml_repr)
         .into_diagnostic()
         .wrap_err("failed to serialize policy to YAML")
 }
@@ -443,6 +493,8 @@ pub enum PolicyViolation {
     FieldTooLong { path: String, length: usize },
     /// Too many filesystem paths in the policy.
     TooManyPaths { count: usize },
+    /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
+    TldWildcard { policy_name: String, host: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -472,6 +524,13 @@ impl fmt::Display for PolicyViolation {
                     "too many filesystem paths ({count} > {MAX_FILESYSTEM_PATHS})"
                 )
             }
+            Self::TldWildcard { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': TLD wildcard '{host}' is not allowed; \
+                     use subdomain wildcards like '*.example.com' instead"
+                )
+            }
         }
     }
 }
@@ -489,6 +548,7 @@ impl fmt::Display for PolicyViolation {
 /// - Read-write paths must not be overly broad (just `/`)
 /// - Individual path lengths must not exceed [`MAX_PATH_LENGTH`]
 /// - Total path count must not exceed [`MAX_FILESYSTEM_PATHS`]
+/// - Network endpoint hosts must not use TLD wildcards (e.g. `*.com`)
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
@@ -554,6 +614,26 @@ pub fn validate_sandbox_policy(
                 violations.push(PolicyViolation::OverlyBroadPath {
                     path: path_str.clone(),
                 });
+            }
+        }
+    }
+
+    // Check network policy endpoint hosts for TLD wildcards.
+    for (key, rule) in &policy.network_policies {
+        let name = if rule.name.is_empty() {
+            key.clone()
+        } else {
+            rule.name.clone()
+        };
+        for ep in &rule.endpoints {
+            if ep.host.contains('*') && (ep.host.starts_with("*.") || ep.host.starts_with("**.")) {
+                let label_count = ep.host.split('.').count();
+                if label_count <= 2 {
+                    violations.push(PolicyViolation::TldWildcard {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                    });
+                }
             }
         }
     }
@@ -752,6 +832,49 @@ network_policies:
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.binaries.len(), 1);
         assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
+    }
+
+    #[test]
+    fn parse_l7_query_matchers_and_round_trip() {
+        let yaml = r#"
+version: 1
+network_policies:
+  query_test:
+    name: query_test
+    endpoints:
+      - host: api.example.com
+        port: 8080
+        protocol: rest
+        rules:
+          - allow:
+              method: GET
+              path: /download
+              query:
+                slug: "my-*"
+                tag:
+                  any: ["foo-*", "bar-*"]
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let allow = proto.network_policies["query_test"].endpoints[0].rules[0]
+            .allow
+            .as_ref()
+            .expect("allow");
+        assert_eq!(allow.query["slug"].glob, "my-*");
+        assert_eq!(allow.query["slug"].any, Vec::<String>::new());
+        assert_eq!(allow.query["tag"].any, vec!["foo-*", "bar-*"]);
+        assert!(allow.query["tag"].glob.is_empty());
+
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let proto_round_trip = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        let allow_round_trip = proto_round_trip.network_policies["query_test"].endpoints[0].rules
+            [0]
+        .allow
+        .as_ref()
+        .expect("allow");
+        assert_eq!(allow_round_trip.query["slug"].glob, "my-*");
+        assert_eq!(allow_round_trip.query["tag"].any, vec!["foo-*", "bar-*"]);
     }
 
     #[test]
@@ -966,6 +1089,88 @@ network_policies:
     }
 
     #[test]
+    fn validate_rejects_tld_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "bad".into(),
+            NetworkPolicyRule {
+                name: "bad-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::TldWildcard { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_double_star_tld_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "bad".into(),
+            NetworkPolicyRule {
+                name: "bad-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "**.org".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::TldWildcard { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_accepts_subdomain_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "ok".into(),
+            NetworkPolicyRule {
+                name: "ok-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.example.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_explicit_domain() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "ok".into(),
+            NetworkPolicyRule {
+                name: "ok-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
     fn normalize_path_collapses_separators() {
         assert_eq!(normalize_path("/usr//lib"), "/usr/lib");
         assert_eq!(normalize_path("/usr/./lib"), "/usr/lib");
@@ -1115,6 +1320,22 @@ network_policies:
         assert_eq!(
             proto1.network_policies["test"].endpoints[0].host,
             proto2.network_policies["test"].endpoints[0].host
+        );
+    }
+
+    #[test]
+    fn rejects_port_above_65535() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    endpoints:
+      - host: example.com
+        port: 70000
+"#;
+        assert!(
+            parse_sandbox_policy(yaml).is_err(),
+            "port >65535 should fail to parse"
         );
     }
 }

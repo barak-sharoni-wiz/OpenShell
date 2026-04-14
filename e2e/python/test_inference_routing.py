@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 _BASE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
     include_workdir=True,
-    read_only=["/usr", "/lib", "/etc", "/app", "/var/log"],
+    read_only=["/usr", "/lib", "/etc", "/app", "/var/log", "/proc", "/dev/urandom"],
     read_write=["/sandbox", "/tmp"],
 )
 _BASE_LANDLOCK = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
@@ -94,11 +94,6 @@ def _upsert_managed_inference(
                 break
             except grpc.RpcError as create_exc:
                 if create_exc.code() == grpc.StatusCode.ALREADY_EXISTS:
-                    continue
-                if (
-                    create_exc.code() == grpc.StatusCode.INTERNAL
-                    and "UNIQUE constraint failed" in (create_exc.details() or "")
-                ):
                     continue
                 raise
     else:

@@ -18,12 +18,21 @@
 # embedded DNS resolver at 127.0.0.11. Docker's DNS listens on random high
 # ports (visible in the DOCKER_OUTPUT iptables chain), so we parse those ports
 # and set up DNAT rules to forward DNS traffic from k3s pods. We then point
-# k3s's --resolv-conf at the container's routable eth0 IP.
+# k3s's resolv-conf kubelet arg at the container's routable eth0 IP.
 #
 # Per k3s docs: "Manually specified resolver configuration files are not
 # subject to viability checks."
 
 set -e
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+# Escape a value for safe embedding as a YAML single-quoted scalar.
+# Single quotes are the only character that needs escaping ('  ->  '').
+yaml_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"
+}
 
 # ---------------------------------------------------------------------------
 # Select iptables backend
@@ -269,8 +278,8 @@ REGEOF
 configs:
   "${REGISTRY_HOST}":
     auth:
-      username: ${REGISTRY_USERNAME}
-      password: ${REGISTRY_PASSWORD}
+      username: $(yaml_quote "${REGISTRY_USERNAME}")
+      password: $(yaml_quote "${REGISTRY_PASSWORD}")
 REGEOF
     fi
 
@@ -284,8 +293,8 @@ REGEOF
             cat >> "$REGISTRIES_YAML" <<REGEOF
   "${COMMUNITY_REGISTRY_HOST}":
     auth:
-      username: ${COMMUNITY_REGISTRY_USERNAME}
-      password: ${COMMUNITY_REGISTRY_PASSWORD}
+      username: $(yaml_quote "${COMMUNITY_REGISTRY_USERNAME}")
+      password: $(yaml_quote "${COMMUNITY_REGISTRY_PASSWORD}")
 REGEOF
         else
             cat >> "$REGISTRIES_YAML" <<REGEOF
@@ -293,8 +302,8 @@ REGEOF
 configs:
   "${COMMUNITY_REGISTRY_HOST}":
     auth:
-      username: ${COMMUNITY_REGISTRY_USERNAME}
-      password: ${COMMUNITY_REGISTRY_PASSWORD}
+      username: $(yaml_quote "${COMMUNITY_REGISTRY_USERNAME}")
+      password: $(yaml_quote "${COMMUNITY_REGISTRY_PASSWORD}")
 REGEOF
         fi
     fi
@@ -452,15 +461,24 @@ if [ -n "${IMAGE_TAG:-}" ] && [ -f "$HELMCHART" ]; then
     sed -i -E "s|tag:[[:space:]]*\"?latest\"?|tag: \"${IMAGE_TAG}\"|" "$HELMCHART"
 fi
 
-if [ -n "${IMAGE_PULL_POLICY:-}" ] && [ -f "$HELMCHART" ]; then
-    echo "Overriding image pull policy to: ${IMAGE_PULL_POLICY}"
-    sed -i "s|pullPolicy: Always|pullPolicy: ${IMAGE_PULL_POLICY}|" "$HELMCHART"
+if [ -f "$HELMCHART" ]; then
+    IMAGE_PULL_POLICY_VALUE="${IMAGE_PULL_POLICY:-Always}"
+    if [ -n "${IMAGE_PULL_POLICY:-}" ]; then
+        echo "Overriding image pull policy to: ${IMAGE_PULL_POLICY}"
+    fi
+    sed -i "s|__IMAGE_PULL_POLICY__|${IMAGE_PULL_POLICY_VALUE}|g" "$HELMCHART"
+
+    SANDBOX_IMAGE_PULL_POLICY_VALUE="${SANDBOX_IMAGE_PULL_POLICY:-\"\"}"
+    sed -i "s|__SANDBOX_IMAGE_PULL_POLICY__|${SANDBOX_IMAGE_PULL_POLICY_VALUE}|g" "$HELMCHART"
+
+    DB_URL_VALUE="${DB_URL:-\"sqlite:/var/openshell/openshell.db\"}"
+    sed -i "s|__DB_URL__|${DB_URL_VALUE}|g" "$HELMCHART"
 fi
 
-# Generate a random SSH handshake secret for the NSSH1 HMAC handshake between
-# the gateway and sandbox SSH servers. This is required — the server will refuse
-# to start without it.
-SSH_HANDSHAKE_SECRET="${SSH_HANDSHAKE_SECRET:-$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d ' \n')}"
+# SSH handshake secret: previously generated here and injected via sed into the
+# HelmChart CR. Now persisted as a Kubernetes Secret (openshell-ssh-handshake)
+# created by the bootstrap process after k3s starts. This ensures the secret
+# survives container restarts without regeneration.
 
 # Inject SSH gateway host/port into the HelmChart manifest so the openshell
 # server returns the correct address to CLI clients for SSH proxy CONNECT.
@@ -479,9 +497,6 @@ if [ -f "$HELMCHART" ]; then
         # Clear the placeholder so the default (8080) is used
         sed -i "s|sshGatewayPort: __SSH_GATEWAY_PORT__|sshGatewayPort: 0|g" "$HELMCHART"
     fi
-    echo "Setting SSH handshake secret"
-    sed -i "s|__SSH_HANDSHAKE_SECRET__|${SSH_HANDSHAKE_SECRET}|g" "$HELMCHART"
-
     # Disable gateway auth: when set, the server accepts connections without
     # client certificates (for reverse-proxy / Cloudflare Tunnel deployments).
     if [ "${DISABLE_GATEWAY_AUTH:-}" = "true" ]; then
@@ -562,6 +577,26 @@ fi
 # routing to settle first.
 wait_for_default_route
 
-# Execute k3s with explicit resolv-conf.
+# ---------------------------------------------------------------------------
+# Deterministic k3s node name
+# ---------------------------------------------------------------------------
+# By default k3s uses the container hostname (= Docker container ID) as the
+# node name.  When the container is recreated (e.g. after an image upgrade),
+# the container ID changes, registering a new k3s node.  The bootstrap code
+# then deletes PVCs whose backing PVs have node affinity for the old node —
+# wiping the server database and any sandbox persistent volumes.
+#
+# OPENSHELL_NODE_NAME is set by the bootstrap code to a deterministic value
+# derived from the gateway name, so the node identity survives container
+# recreation and PVCs are never orphaned.
+NODE_NAME_ARG=""
+if [ -n "${OPENSHELL_NODE_NAME:-}" ]; then
+    NODE_NAME_ARG="--node-name=${OPENSHELL_NODE_NAME}"
+    echo "Using deterministic k3s node name: ${OPENSHELL_NODE_NAME}"
+fi
+
+# Execute k3s with explicit resolv-conf passed as a kubelet arg.
+# k3s v1.35.2+ no longer accepts --resolv-conf as a top-level server flag;
+# it must be passed via --kubelet-arg instead.
 # shellcheck disable=SC2086
-exec /bin/k3s "$@" --resolv-conf="$RESOLV_CONF" $EXTRA_KUBELET_ARGS
+exec /bin/k3s "$@" $NODE_NAME_ARG --kubelet-arg=resolv-conf="$RESOLV_CONF" $EXTRA_KUBELET_ARGS

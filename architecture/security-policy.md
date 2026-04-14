@@ -320,7 +320,7 @@ Controls which filesystem paths the sandboxed process can access. Enforced via L
 | `read_only`       | `string[]` | `[]`    | Paths accessible in read-only mode                             |
 | `read_write`      | `string[]` | `[]`    | Paths accessible in read-write mode                            |
 
-**Enforcement mapping**: Each path becomes a Landlock `PathBeneath` rule. Read-only paths receive `AccessFs::from_read(ABI::V1)` permissions. Read-write paths receive `AccessFs::from_all(ABI::V1)` permissions (read, write, execute, create, delete, rename). All other paths are denied by the Landlock ruleset.
+**Enforcement mapping**: Each path becomes a Landlock `PathBeneath` rule. Read-only paths receive `AccessFs::from_read(ABI::V2)` permissions. Read-write paths receive `AccessFs::from_all(ABI::V2)` permissions (read, write, execute, create, delete, rename). All other paths are denied by the Landlock ruleset.
 
 **Filesystem preparation**: Before the child process spawns, the supervisor creates any `read_write` directories that do not exist and sets their ownership to `process.run_as_user`:`process.run_as_group` via `chown()`. See `crates/openshell-sandbox/src/lib.rs` -- `prepare_filesystem()`.
 
@@ -358,10 +358,16 @@ Controls Landlock LSM compatibility behavior. **Static field** -- immutable afte
 
 | Value              | Behavior                                                                                                                    |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `best_effort`      | If Landlock is unavailable (older kernel, unprivileged container), log a warning and continue without filesystem sandboxing |
-| `hard_requirement` | If Landlock is unavailable, abort sandbox startup with an error                                                             |
+| `best_effort`      | If Landlock is unavailable (older kernel, unprivileged container), log a warning and continue without filesystem sandboxing. Individual inaccessible paths (missing, permission denied, symlink loops) are skipped with a warning while remaining rules are still applied. If all paths fail, the sandbox continues without Landlock rather than applying an empty ruleset that would block all access. |
+| `hard_requirement` | If Landlock is unavailable or any configured path cannot be opened, abort sandbox startup with an error.                    |
 
-See `crates/openshell-sandbox/src/sandbox/linux/landlock.rs` -- `compat_level()`.
+**Per-path error handling**: `PathFd::new()` (which wraps `open(path, O_PATH | O_CLOEXEC)`) can fail for several reasons beyond path non-existence: `EACCES` (permission denied), `ELOOP` (symlink loop), `ENAMETOOLONG`, `ENOTDIR`. Each failure is classified with a human-readable reason in logs. In `best_effort` mode, the path is skipped and ruleset construction continues. In `hard_requirement` mode, the error is fatal.
+
+**Baseline path filtering**: The enrichment functions (`enrich_proto_baseline_paths`, `enrich_sandbox_baseline_paths`) pre-filter system-injected baseline paths (e.g., `/app`) by checking `Path::exists()` before adding them to the policy. This prevents missing baseline paths from reaching Landlock at all. User-specified paths are not pre-filtered — they are evaluated at Landlock apply time so that misconfigurations surface as warnings (`best_effort`) or errors (`hard_requirement`).
+
+**Zero-rule safety check**: If all paths in the ruleset fail to open, `apply()` returns an error rather than calling `restrict_self()` on an empty ruleset. An empty Landlock ruleset with `restrict_self()` would block all filesystem access — the inverse of the intended degradation behavior. This error is caught by the outer `BestEffort` handler, which logs a warning and continues without Landlock.
+
+See `crates/openshell-sandbox/src/sandbox/linux/landlock.rs` -- `compat_level()`, `try_open_path()`, `classify_path_fd_error()`, `classify_io_error()`.
 
 ```yaml
 landlock:
@@ -437,7 +443,7 @@ Each endpoint defines a network destination and, optionally, L7 inspection behav
 | `enforcement`  | `string`   | `"audit"`       | L7 enforcement mode: `"enforce"` or `"audit"`                                                                       |
 | `access`       | `string`   | `""`            | Shorthand preset for common L7 rule sets. Mutually exclusive with `rules`.                                          |
 | `rules`        | `L7Rule[]` | `[]`            | Explicit L7 allow rules. Mutually exclusive with `access`.                                                          |
-| `allowed_ips`  | `string[]` | `[]`            | IP allowlist for SSRF override. See [Private IP Access via `allowed_ips`](#private-ip-access-via-allowed_ips).       |
+| `allowed_ips`  | `string[]` | `[]`            | IP allowlist for SSRF override. Entries overlapping always-blocked ranges (loopback, link-local, unspecified) are rejected at load time. See [Private IP Access via `allowed_ips`](#private-ip-access-via-allowed_ips). |
 
 #### `NetworkBinary`
 
@@ -461,9 +467,14 @@ rules:
   - allow:
       method: GET
       path: "/repos/**"
+      query:
+        per_page: "1*"
   - allow:
       method: POST
       path: "/repos/*/issues"
+      query:
+        labels:
+          any: ["bug*", "p1*"]
 ```
 
 #### `L7Allow`
@@ -473,8 +484,9 @@ rules:
 | `method`  | `string` | HTTP method: `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, or `*` (any). Case-insensitive matching.            |
 | `path`    | `string` | URL path glob pattern: `**` matches everything, otherwise `glob.match` with `/` delimiter.                                   |
 | `command` | `string` | SQL command: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, or `*` (any). Case-insensitive matching. For `protocol: sql` endpoints. |
+| `query`   | `map`    | Optional REST query rules keyed by decoded query param name. Value is either a glob string (for example, `tag: "foo-*"`) or `{ any: ["foo-*", "bar-*"] }`. |
 
-Method and command fields use `*` as wildcard for "any". Path patterns use `**` for "match everything" and standard glob patterns with `/` as a delimiter otherwise. See `sandbox-policy.rego` -- `method_matches()`, `path_matches()`, `command_matches()`.
+Method and command fields use `*` as wildcard for "any". Path patterns use `**` for "match everything" and standard glob patterns with `/` as a delimiter otherwise. Query matching is case-sensitive and evaluates decoded values; when duplicate keys are present in the request, every value for that key must match the configured matcher. See `sandbox-policy.rego` -- `method_matches()`, `path_matches()`, `command_matches()`, `query_params_match()`.
 
 #### Access Presets
 
@@ -716,7 +728,7 @@ If any condition fails, the proxy returns `403 Forbidden`.
 7. Rewrites the request: absolute-form → origin-form (`GET /path HTTP/1.1`), strips hop-by-hop headers, adds `Via: 1.1 openshell-sandbox` and `Connection: close`
 8. Forwards the rewritten request, then relays bidirectionally using `tokio::io::copy_bidirectional` (supports chunked transfer, SSE streams, and other long-lived responses with no idle timeout)
 
-**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive) and does not perform L7 inspection on the forwarded traffic. Every forward proxy connection handles exactly one request-response exchange.
+**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive). Every forward proxy connection handles exactly one request-response exchange. When an endpoint has L7 rules configured, the forward proxy evaluates the single request's method and path against L7 policy before forwarding.
 
 **Implementation**: See `crates/openshell-sandbox/src/proxy.rs` -- `handle_forward_proxy()`, `parse_proxy_uri()`, `rewrite_forward_request()`.
 
@@ -838,6 +850,10 @@ The response includes an `X-OpenShell-Policy` header and `Connection: close`. Se
 
 ## Seccomp Filter Details
 
+The seccomp filter uses a default-allow policy (`SeccompAction::Allow`) with targeted rules that return `EPERM`. It provides three layers of protection: socket domain blocks, unconditional syscall blocks, and conditional syscall blocks. See `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`.
+
+### Blocked socket domains
+
 Regardless of network mode, certain socket domains are always blocked:
 
 | Domain         | Constant | Reason                                                                          |
@@ -849,7 +865,30 @@ Regardless of network mode, certain socket domains are always blocked:
 
 In proxy mode (which is always active), `AF_INET` (2) and `AF_INET6` (10) are allowed so the sandbox process can reach the proxy.
 
-The seccomp filter uses a default-allow policy (`SeccompAction::Allow`) with specific `socket()` syscall rules that return `EPERM` when the first argument (domain) matches a blocked value. See `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`.
+### Blocked syscalls
+
+These syscalls are blocked unconditionally (EPERM for any invocation):
+
+| Syscall | NR (x86-64) | Reason |
+|---------|-------------|--------|
+| `memfd_create` | 319 | Fileless binary execution bypasses Landlock filesystem restrictions |
+| `ptrace` | 101 | Cross-process memory inspection and code injection |
+| `bpf` | 321 | Kernel BPF program loading |
+| `process_vm_readv` | 310 | Cross-process memory read |
+| `io_uring_setup` | 425 | Async I/O subsystem with extensive CVE history |
+| `mount` | 165 | Filesystem mount could subvert Landlock or overlay writable paths |
+
+### Conditionally blocked syscalls
+
+These syscalls are blocked only when specific flag patterns are present in their arguments:
+
+| Syscall | NR (x86-64) | Condition | Reason |
+|---------|-------------|-----------|--------|
+| `execveat` | 322 | `AT_EMPTY_PATH` (0x1000) set in flags (arg4) | Fileless execution from an anonymous fd |
+| `unshare` | 272 | `CLONE_NEWUSER` (0x10000000) set in flags (arg0) | User namespace creation enables privilege escalation |
+| `seccomp` | 317 | operation == `SECCOMP_SET_MODE_FILTER` (1) in arg0 | Prevents sandboxed code from replacing the active filter |
+
+Flag checks use `MaskedEq` (`(arg & mask) == mask`) to detect the flag bit regardless of other bits. The `seccomp` syscall check uses `Eq` for exact value comparison on the operation argument.
 
 ---
 
@@ -954,6 +993,7 @@ The following validation rules are enforced during policy loading (both file mod
 | `rules: []` (empty list)                       | `rules list cannot be empty (would deny all traffic). Use access: full or remove rules.`   |
 | Host wildcard is bare `*` or `**`              | `host wildcard '*' matches all hosts; use specific patterns like '*.example.com'`          |
 | Host wildcard does not start with `*.` or `**.`| `host wildcard must start with '*.' or '**.' (e.g., '*.example.com'), got '{host}'`        |
+| `allowed_ips` entry overlaps always-blocked range | `allowed_ips entry {entry} falls within always-blocked range (loopback/link-local/unspecified)` |
 | Invalid HTTP method in REST rules              | _(warning, not error)_                                                                     |
 
 ### Errors (Live Update Rejection)
@@ -965,6 +1005,16 @@ These errors are returned by the gateway's `UpdateSandboxPolicy` handler and rej
 | `filesystem_policy` differs from version 1 | `filesystem policy cannot be changed on a live sandbox (applied at startup)` |
 | `landlock` differs from version 1 | `landlock policy cannot be changed on a live sandbox (applied at startup)` |
 | `process` differs from version 1 | `process policy cannot be changed on a live sandbox (applied at startup)` |
+
+### Errors (Rule Merge Rejection)
+
+These errors are returned by the gateway's `merge_chunk_into_policy` when approving proposed rules. See `crates/openshell-server/src/grpc/policy.rs` -- `validate_rule_not_always_blocked()`.
+
+| Condition | Error Message |
+|-----------|---------------|
+| Proposed endpoint host is a literal always-blocked IP | `proposed rule endpoint host '{host}' is an always-blocked address (loopback/link-local/unspecified)` |
+| Proposed endpoint host is `localhost` | `proposed rule endpoint host 'localhost' is always blocked` |
+| Proposed `allowed_ips` entry overlaps always-blocked range | `proposed rule contains always-blocked allowed_ips entry '{entry}'` |
 
 ### Warnings (Log Only)
 
@@ -993,9 +1043,13 @@ These IP ranges are **always blocked**, even when `allowed_ips` is configured on
 |-------|-------------|--------|
 | `127.0.0.0/8` | IPv4 loopback | Prevents proxy bypass via localhost |
 | `169.254.0.0/16` | IPv4 link-local | Prevents cloud metadata SSRF (`169.254.169.254`) |
+| `0.0.0.0` | IPv4 unspecified | Prevents binding/connecting to all interfaces |
 | `::1` | IPv6 loopback | Prevents proxy bypass via IPv6 localhost |
+| `::` | IPv6 unspecified | Prevents binding/connecting to all interfaces |
 | `fe80::/10` | IPv6 link-local | Prevents IPv6 link-local access |
 | `::ffff:0:0/96` (mapped) | IPv4-mapped IPv6 addresses are unwrapped and checked as IPv4 | |
+
+These ranges are enforced at multiple layers: load-time validation rejects `allowed_ips` entries that overlap these ranges (see [`parse_allowed_ips`](#implementation)), the server rejects proposed rules targeting them (see [Server-Side Defense-in-Depth](#server-side-defense-in-depth)), and the proxy runtime blocks resolved IPs that fall within them.
 
 ### Default-Blocked IP Ranges (Private)
 
@@ -1010,17 +1064,32 @@ These ranges are blocked by default but can be selectively allowed via the `allo
 
 ### Implementation
 
-Functions in `crates/openshell-sandbox/src/proxy.rs` implement the SSRF checks:
+IP classification helpers live in `crates/openshell-core/src/net.rs` and are shared across the sandbox proxy, the mechanistic mapper, and the gateway server:
 
-- **`is_internal_ip(ip: IpAddr) -> bool`**: Classifies an IP address as internal or public. Checks loopback, link-local, and RFC 1918 ranges. For IPv6, unwraps IPv4-mapped addresses (`::ffff:x.x.x.x`) via `to_ipv4_mapped()` and applies IPv4 checks. Used in the default (no `allowed_ips`) code path.
+- **`is_always_blocked_ip(ip: IpAddr) -> bool`**: Checks if an IP is always blocked regardless of policy — loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), and unspecified (`0.0.0.0`). For IPv6, unwraps IPv4-mapped addresses (`::ffff:x.x.x.x`) via `to_ipv4_mapped()` and applies IPv4 checks. Used in the `allowed_ips` code path and by `implicit_allowed_ips_for_ip_host` to enforce the hard block even when private IPs are permitted.
 
-- **`is_always_blocked_ip(ip: IpAddr) -> bool`**: Checks if an IP is always blocked regardless of policy — loopback and link-local only. Used in the `allowed_ips` code path to enforce the hard block on loopback and link-local even when private IPs are permitted.
+- **`is_always_blocked_net(net: IpNet) -> bool`**: Checks if a CIDR network overlaps any always-blocked range. Returns `true` if the network contains or overlaps loopback, link-local, or unspecified addresses. A CIDR like `0.0.0.0/0` is rejected because it contains always-blocked addresses. Used at policy load time by `parse_allowed_ips` and at server-side approval time by `validate_rule_not_always_blocked`.
+
+- **`is_internal_ip(ip: IpAddr) -> bool`**: Classifies an IP address as internal or public. Broader than `is_always_blocked_ip` — also includes RFC 1918 private ranges (`10/8`, `172.16/12`, `192.168/16`) and IPv6 ULA (`fc00::/7`). Used in the default (no `allowed_ips`) SSRF code path and by the mechanistic mapper to detect when `allowed_ips` should be populated in proposals.
+
+Runtime resolution and enforcement functions remain in `crates/openshell-sandbox/src/proxy.rs`:
 
 - **`resolve_and_reject_internal(host, port) -> Result<Vec<SocketAddr>, String>`**: Default SSRF check. Resolves DNS via `tokio::net::lookup_host()`, then checks every resolved address against `is_internal_ip()`. If any address is internal, the entire connection is rejected.
 
 - **`resolve_and_check_allowed_ips(host, port, allowed_ips) -> Result<Vec<SocketAddr>, String>`**: Allowlist-based SSRF check. Resolves DNS, rejects any always-blocked IPs, then verifies every resolved address matches at least one entry in the `allowed_ips` list.
 
-- **`parse_allowed_ips(raw) -> Result<Vec<IpNet>, String>`**: Parses CIDR/IP strings into typed `IpNet` values. Rejects entries that cover loopback or link-local ranges. Accepts both CIDR notation (`10.0.5.0/24`) and bare IPs (`10.0.5.20`, treated as `/32`).
+- **`parse_allowed_ips(raw) -> Result<Vec<IpNet>, String>`**: Parses CIDR/IP strings into typed `IpNet` values. **Rejects entries at load time** that overlap always-blocked ranges (loopback, link-local, unspecified) via `is_always_blocked_net`. Accepts both CIDR notation (`10.0.5.0/24`) and bare IPs (`10.0.5.20`, treated as `/32`). This prevents confusing UX where an entry is accepted in policy but silently denied at runtime.
+
+- **`implicit_allowed_ips_for_ip_host(host) -> Vec<String>`**: When a policy endpoint has a literal IP address as its host (e.g., `10.0.5.20`), synthesizes an `allowed_ips` entry so the allowlist-validation path is used instead of blanket internal-IP rejection. **Skips always-blocked addresses** — if the host is loopback, link-local, or unspecified, returns empty and logs a warning instead of synthesizing an un-enforceable entry.
+
+### Server-Side Defense-in-Depth
+
+The gateway server provides an additional validation layer when merging proposed rules into a sandbox's active policy. Before `merge_chunk_into_policy` applies a proposed rule, it calls `validate_rule_not_always_blocked` (in `crates/openshell-server/src/grpc/policy.rs`) which:
+
+1. Checks if the proposed endpoint host is a literal always-blocked IP (via `is_always_blocked_ip`) or `localhost`.
+2. Checks each `allowed_ips` entry for overlap with always-blocked ranges (via `is_always_blocked_net`).
+
+If either check fails, the merge returns `INVALID_ARGUMENT` and the proposed rule is not applied. This prevents always-blocked destinations from entering the active policy even if the sandbox's mechanistic mapper or an older sandbox version did not filter them.
 
 ### Placement in Proxy Flow
 
@@ -1036,8 +1105,11 @@ flowchart TD
     D --> E{Allowed?}
     E -- No --> F["403 Forbidden"]
     E -- Yes --> G{allowed_ips on endpoint?}
-    G -- Yes --> H["resolve_and_check_allowed_ips(host, port, nets)"]
-    H --> I{All IPs in allowlist<br/>and not loopback/link-local?}
+    G -- Yes --> VAL["parse_allowed_ips:<br/>validate no always-blocked entries"]
+    VAL --> VAL_OK{Valid?}
+    VAL_OK -- No --> J2["Connection rejected<br/>(always-blocked entry in allowed_ips)"]
+    VAL_OK -- Yes --> H["resolve_and_check_allowed_ips(host, port, nets)"]
+    H --> I{All IPs in allowlist<br/>and not always-blocked?}
     I -- No --> J["403 Forbidden + log warning"]
     I -- Yes --> K["TcpStream::connect(resolved addrs)"]
     G -- No --> L["resolve_and_reject_internal(host, port)"]
@@ -1047,7 +1119,8 @@ flowchart TD
     K --> N["200 Connection Established"]
 
     FP --> FP_OPA["OPA evaluation + require allowed_ips"]
-    FP_OPA --> FP_RESOLVE["resolve_and_check_allowed_ips"]
+    FP_OPA --> FP_VAL["parse_allowed_ips: validate"]
+    FP_VAL --> FP_RESOLVE["resolve_and_check_allowed_ips"]
     FP_RESOLVE --> FP_PRIVATE{All IPs private?}
     FP_PRIVATE -- No --> J
     FP_PRIVATE -- Yes --> FP_CONNECT["TCP connect + rewrite + relay"]
@@ -1055,7 +1128,11 @@ flowchart TD
 
 ### Private IP Access via `allowed_ips`
 
-The `allowed_ips` field on a `NetworkEndpoint` enables controlled access to private IP space. When present, the default SSRF internal-IP rejection is replaced by an allowlist check: resolved IPs must match at least one entry in `allowed_ips`, and loopback/link-local are still always blocked.
+The `allowed_ips` field on a `NetworkEndpoint` enables controlled access to private IP space. When present, the default SSRF internal-IP rejection is replaced by an allowlist check: resolved IPs must match at least one entry in `allowed_ips`, and always-blocked ranges (loopback, link-local, unspecified) are still rejected.
+
+**Load-time validation**: `parse_allowed_ips` rejects entries that overlap always-blocked ranges with a hard error at policy load time. This catches misconfigurations early — an entry like `127.0.0.0/8` or `0.0.0.0/0` in `allowed_ips` would be silently un-enforceable at runtime, so it is rejected before the policy is applied. The same validation runs in both file mode (sandbox startup) and gRPC mode (live policy updates via `OpaEngine::reload_from_proto`).
+
+**Implicit `allowed_ips` for IP hosts**: When a policy endpoint has a literal IP address as its host (e.g., `host: 10.0.5.20`), the proxy synthesizes an `allowed_ips` entry automatically via `implicit_allowed_ips_for_ip_host`. If the host is an always-blocked address (e.g., `127.0.0.1`, `169.254.169.254`, `0.0.0.0`), the function returns empty and logs a warning — no `allowed_ips` entry is synthesized, so the standard SSRF rejection applies.
 
 This supports three usage modes:
 
@@ -1071,7 +1148,7 @@ Entries can be:
 - **CIDR notation**: `10.0.5.0/24`, `172.16.0.0/12`, `192.168.1.0/24`
 - **Exact IP**: `10.0.5.20` (treated as `/32` for IPv4 or `/128` for IPv6)
 
-Entries that cover loopback (`127.0.0.0/8`) or link-local (`169.254.0.0/16`) ranges are rejected at parse time.
+Entries that overlap always-blocked ranges — loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) — are rejected at load time with a hard error. Broad CIDRs that contain always-blocked addresses (e.g., `0.0.0.0/0`) are also rejected.
 
 #### Hostless Endpoints (`allowed_ips` without `host`)
 

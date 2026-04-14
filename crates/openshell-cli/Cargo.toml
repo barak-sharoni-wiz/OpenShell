@@ -19,6 +19,7 @@ openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-core = { path = "../openshell-core" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
+openshell-prover = { path = "../openshell-prover" }
 openshell-tui = { path = "../openshell-tui" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -75,6 +76,7 @@ tracing-subscriber = { workspace = true }
 workspace = true
 
 [features]
+bundled-z3 = ["openshell-prover/bundled-z3"]
 dev-settings = ["openshell-core/dev-settings"]
 
 [dev-dependencies]

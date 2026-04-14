@@ -24,13 +24,13 @@ use openshell_bootstrap::{
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
+    ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
     GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
     ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
     RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
     SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
-    UpdateProviderRequest, WatchSandboxRequest, setting_value,
+    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_providers::{
@@ -38,7 +38,7 @@ use openshell_providers::{
 };
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -843,7 +843,61 @@ fn gateway_type_label(gateway: &GatewayMetadata) -> &'static str {
 }
 
 fn gateway_auth_label(gateway: &GatewayMetadata) -> &str {
-    gateway.auth_mode.as_deref().unwrap_or("unknown")
+    match gateway.auth_mode.as_deref() {
+        Some(auth_mode) => auth_mode,
+        None if gateway.gateway_endpoint.starts_with("http://") => "plaintext",
+        None => "mtls",
+    }
+}
+
+fn is_loopback_gateway_endpoint(endpoint: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(endpoint) else {
+        return false;
+    };
+
+    match parsed.host() {
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+fn plaintext_gateway_is_remote(endpoint: &str, remote: Option<&str>, local: bool) -> bool {
+    if local {
+        return false;
+    }
+    if remote.is_some() {
+        return true;
+    }
+    !is_loopback_gateway_endpoint(endpoint)
+}
+
+fn plaintext_gateway_metadata(
+    name: &str,
+    endpoint: &str,
+    remote: Option<&str>,
+    local: bool,
+) -> GatewayMetadata {
+    let (remote_host, resolved_host) = if let Some(dest) = remote {
+        let ssh_host = extract_host_from_ssh_destination(dest);
+        let resolved = resolve_ssh_hostname(&ssh_host);
+        (Some(dest.to_string()), Some(resolved))
+    } else {
+        (None, None)
+    };
+
+    GatewayMetadata {
+        name: name.to_string(),
+        gateway_endpoint: endpoint.to_string(),
+        is_remote: plaintext_gateway_is_remote(endpoint, remote, local),
+        gateway_port: 0,
+        remote_host,
+        resolved_host,
+        auth_mode: Some("plaintext".to_string()),
+        edge_team_domain: None,
+        edge_auth_url: None,
+    }
 }
 
 fn gateway_select_with<F>(
@@ -889,8 +943,12 @@ where
 
 /// Register an existing gateway.
 ///
-/// Without extra flags the gateway is treated as an edge-authenticated (cloud)
-/// gateway and a browser is opened for authentication.
+/// An `http://...` endpoint is registered as a direct plaintext gateway with
+/// no mTLS extraction or browser authentication.
+///
+/// Without extra flags, an `https://...` endpoint is treated as an
+/// edge-authenticated (cloud) gateway and a browser is opened for
+/// authentication.
 ///
 /// Pass `remote` (SSH destination) to register a remote mTLS gateway, or
 /// `local = true` for a local mTLS gateway. In both cases the CLI extracts
@@ -983,6 +1041,26 @@ pub async fn gateway_add(
             name,
             name,
         ));
+    }
+
+    if endpoint.starts_with("http://") {
+        let metadata = plaintext_gateway_metadata(name, &endpoint, remote, local);
+        let gateway_type = gateway_type_label(&metadata);
+        let gateway_auth = gateway_auth_label(&metadata);
+
+        store_gateway_metadata(name, &metadata)?;
+        save_active_gateway(name)?;
+
+        eprintln!(
+            "{} Gateway '{}' added and set as active",
+            "✓".green().bold(),
+            name,
+        );
+        eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint);
+        eprintln!("  {} {}", "Type:".dimmed(), gateway_type);
+        eprintln!("  {} {}", "Auth:".dimmed(), gateway_auth);
+
+        return Ok(());
     }
 
     if remote.is_some() || local {
@@ -1355,7 +1433,7 @@ pub async fn gateway_admin_deploy(
     disable_gateway_auth: bool,
     registry_username: Option<&str>,
     registry_token: Option<&str>,
-    gpu: bool,
+    gpu: Vec<String>,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
@@ -1369,62 +1447,51 @@ pub async fn gateway_admin_deploy(
         opts
     });
 
-    // Check whether a gateway already exists. If so, prompt the user (unless
-    // --recreate was passed or we're in non-interactive mode).
-    let mut should_recreate = recreate;
-    if let Some(existing) =
-        openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
-    {
-        if !should_recreate {
-            let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-            if interactive {
-                let status = if existing.container_running {
-                    "running"
-                } else if existing.container_exists {
-                    "stopped"
-                } else {
-                    "volume only"
-                };
-                eprintln!();
+    // If the gateway is already running and we're not recreating, short-circuit.
+    if !recreate {
+        if let Some(existing) =
+            openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
+        {
+            if existing.container_running {
                 eprintln!(
-                    "{} Gateway '{name}' already exists ({status}).",
-                    "!".yellow().bold()
+                    "{} Gateway '{name}' is already running.",
+                    "✓".green().bold()
                 );
-                if let Some(image) = &existing.container_image {
-                    eprintln!("  {} {}", "Image:".dimmed(), image);
-                }
-                eprintln!();
-                eprint!("Destroy and recreate? [y/N] ");
-                std::io::stderr().flush().ok();
-                let mut input = String::new();
-                std::io::stdin()
-                    .read_line(&mut input)
-                    .into_diagnostic()
-                    .wrap_err("failed to read user input")?;
-                let choice = input.trim().to_lowercase();
-                should_recreate = choice == "y" || choice == "yes";
-                if !should_recreate {
-                    eprintln!("Keeping existing gateway.");
-                    return Ok(());
-                }
-            } else {
-                // Non-interactive mode: reuse existing gateway silently.
-                eprintln!("Gateway '{name}' already exists, reusing.");
                 return Ok(());
             }
         }
     }
 
+    // When resuming an existing gateway (not recreating), prefer the port
+    // and gateway host from stored metadata over the CLI defaults.  The user
+    // may have originally bootstrapped on a non-default port (e.g. `--port
+    // 8082`) or with `--gateway-host host.docker.internal`, and a bare
+    // `gateway start` without those flags should honour the original values.
+    let stored_metadata = if !recreate {
+        openshell_bootstrap::load_gateway_metadata(name).ok()
+    } else {
+        None
+    };
+    let effective_port = stored_metadata
+        .as_ref()
+        .filter(|m| m.gateway_port > 0)
+        .map_or(port, |m| m.gateway_port);
+    let effective_gateway_host: Option<String> = gateway_host.map(String::from).or_else(|| {
+        stored_metadata
+            .as_ref()
+            .and_then(|m| m.gateway_host().map(String::from))
+    });
+
     let mut options = DeployOptions::new(name)
-        .with_port(port)
+        .with_port(effective_port)
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
         .with_gpu(gpu)
-        .with_recreate(should_recreate);
+        .with_recreate(recreate);
     if let Some(opts) = remote_opts {
         options = options.with_remote(opts);
     }
-    if let Some(host) = gateway_host {
+    if let Some(host) = effective_gateway_host {
         options = options.with_gateway_host(host);
     }
     if let Some(username) = registry_username {
@@ -1435,6 +1502,15 @@ pub async fn gateway_admin_deploy(
     }
 
     let handle = deploy_gateway_with_panel(options, name, location).await?;
+
+    // Wait for the gRPC endpoint to actually accept connections before
+    // declaring the gateway ready. The Docker health check may pass before
+    // the gRPC listener inside the pod is fully bound.
+    let server = handle.gateway_endpoint().to_string();
+    let tls = TlsOptions::default()
+        .with_gateway_name(name)
+        .with_default_paths(&server);
+    crate::bootstrap::wait_for_grpc_ready(&server, &tls).await?;
 
     print_deploy_summary(name, &handle);
 
@@ -2045,7 +2121,16 @@ pub async fn sandbox_create(
         name: name.unwrap_or_default().to_string(),
     };
 
-    let response = client.create_sandbox(request).await.into_diagnostic()?;
+    let response = match client.create_sandbox(request).await {
+        Ok(resp) => resp,
+        Err(status) if status.code() == Code::AlreadyExists => {
+            return Err(miette::miette!(
+                "{}\n\nhint: delete it first with: openshell sandbox delete <name>\n      or use a different name",
+                status.message()
+            ));
+        }
+        Err(status) => return Err(status).into_diagnostic(),
+    };
     let sandbox = response
         .into_inner()
         .sandbox
@@ -2111,7 +2196,12 @@ pub async fn sandbox_create(
     // Track whether we have seen a non-Ready phase during the watch.
     let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready);
     let start_time = Instant::now();
-    let provision_timeout = Duration::from_secs(300);
+    let provision_timeout = Duration::from_secs(
+        std::env::var("OPENSHELL_PROVISION_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300),
+    );
     // Track whether we saw the gateway become ready (from log messages).
     let mut saw_gateway_ready = false;
 
@@ -2300,8 +2390,12 @@ pub async fn sandbox_create(
             drop(client);
 
             if let Some((local_path, sandbox_path, git_ignore)) = upload {
-                let dest = sandbox_path.as_deref().unwrap_or("/sandbox");
-                eprintln!("  {} Uploading files to {dest}...", "\u{2022}".dimmed(),);
+                let dest = sandbox_path.as_deref();
+                let dest_display = dest.unwrap_or("~");
+                eprintln!(
+                    "  {} Uploading files to {dest_display}...",
+                    "\u{2022}".dimmed(),
+                );
                 let local = Path::new(local_path);
                 if *git_ignore && let Ok((base_dir, files)) = git_sync_files(local) {
                     sandbox_sync_up_files(
@@ -2439,13 +2533,6 @@ pub async fn sandbox_create(
     }
 }
 
-/// The default community sandbox registry prefix.
-///
-/// Bare sandbox names (e.g., `openclaw`) are expanded to
-/// `{prefix}/{name}:latest` using this value.  Override with the
-/// `OPENSHELL_COMMUNITY_REGISTRY` environment variable.
-const DEFAULT_COMMUNITY_REGISTRY: &str = "ghcr.io/nvidia/openshell-community/sandboxes";
-
 /// Resolved source for the `--from` flag on `sandbox create`.
 enum ResolvedSource {
     /// A ready-to-use container image reference.
@@ -2511,16 +2598,11 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
         ));
     }
 
-    // 3. Looks like a full image reference (contains / : or .).
-    if value.contains('/') || value.contains(':') || value.contains('.') {
-        return Ok(ResolvedSource::Image(value.to_string()));
-    }
-
-    // 4. Community sandbox name.
-    let prefix = std::env::var("OPENSHELL_COMMUNITY_REGISTRY")
-        .unwrap_or_else(|_| DEFAULT_COMMUNITY_REGISTRY.to_string());
-    let prefix = prefix.trim_end_matches('/');
-    Ok(ResolvedSource::Image(format!("{prefix}/{value}:latest")))
+    // 3. Full image reference or community sandbox name — delegate to shared
+    //    resolution in openshell-core.
+    Ok(ResolvedSource::Image(
+        openshell_core::image::resolve_community_image(value),
+    ))
 }
 
 fn source_requests_gpu(source: &str) -> bool {
@@ -2619,7 +2701,6 @@ pub async fn sandbox_sync_command(
 ) -> Result<()> {
     match (up, down) {
         (Some(local_path), None) => {
-            let sandbox_dest = dest.unwrap_or("/sandbox");
             let local = Path::new(local_path);
             if !local.exists() {
                 return Err(miette::miette!(
@@ -2627,8 +2708,9 @@ pub async fn sandbox_sync_command(
                     local.display()
                 ));
             }
-            eprintln!("Syncing {} -> sandbox:{}", local.display(), sandbox_dest);
-            sandbox_sync_up(server, name, local, sandbox_dest, tls).await?;
+            let dest_display = dest.unwrap_or("~");
+            eprintln!("Syncing {} -> sandbox:{}", local.display(), dest_display);
+            sandbox_sync_up(server, name, local, dest, tls).await?;
             eprintln!("{} Sync complete", "✓".green().bold());
         }
         (None, Some(sandbox_path)) => {
@@ -2680,6 +2762,116 @@ pub async fn sandbox_get(server: &str, name: &str, tls: &TlsOptions) -> Result<(
     }
 
     Ok(())
+}
+
+/// Maximum stdin payload size (4 MiB). Prevents the CLI from reading unbounded
+/// data into memory before the server rejects an oversized message.
+const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
+
+/// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
+///
+/// Returns the remote command's exit code.
+pub async fn sandbox_exec_grpc(
+    server: &str,
+    name: &str,
+    command: &[String],
+    workdir: Option<&str>,
+    timeout_seconds: u32,
+    tty_override: Option<bool>,
+    tls: &TlsOptions,
+) -> Result<i32> {
+    let mut client = grpc_client(server, tls).await?;
+
+    // Resolve sandbox name to id.
+    let sandbox = client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+
+    // Verify the sandbox is ready before issuing the exec.
+    if SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready) {
+        return Err(miette::miette!(
+            "sandbox '{}' is not ready (phase: {}); wait for it to reach Ready state",
+            name,
+            phase_name(sandbox.phase)
+        ));
+    }
+
+    // Read stdin if piped (not a TTY), using spawn_blocking to avoid blocking
+    // the async runtime. Cap the read at MAX_STDIN_PAYLOAD + 1 so we never
+    // buffer more than the limit into memory.
+    let stdin_payload = if !std::io::stdin().is_terminal() {
+        tokio::task::spawn_blocking(|| {
+            let limit = (MAX_STDIN_PAYLOAD + 1) as u64;
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .take(limit)
+                .read_to_end(&mut buf)
+                .into_diagnostic()?;
+            if buf.len() > MAX_STDIN_PAYLOAD {
+                return Err(miette::miette!(
+                    "stdin payload exceeds {} byte limit; pipe smaller inputs or use `sandbox upload`",
+                    MAX_STDIN_PAYLOAD
+                ));
+            }
+            Ok(buf)
+        })
+        .await
+        .into_diagnostic()?? // first ? unwraps JoinError, second ? unwraps Result
+    } else {
+        Vec::new()
+    };
+
+    // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
+    let tty = tty_override
+        .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+
+    // Make the streaming gRPC call.
+    let mut stream = client
+        .exec_sandbox(ExecSandboxRequest {
+            sandbox_id: sandbox.id,
+            command: command.to_vec(),
+            workdir: workdir.unwrap_or_default().to_string(),
+            environment: HashMap::new(),
+            timeout_seconds,
+            stdin: stdin_payload,
+            tty,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    // Stream output to terminal in real-time.
+    let mut exit_code = 0i32;
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+
+    while let Some(event) = stream.next().await {
+        let event = event.into_diagnostic()?;
+        match event.payload {
+            Some(exec_sandbox_event::Payload::Stdout(out)) => {
+                let mut handle = stdout.lock();
+                handle.write_all(&out.data).into_diagnostic()?;
+                handle.flush().into_diagnostic()?;
+            }
+            Some(exec_sandbox_event::Payload::Stderr(err)) => {
+                let mut handle = stderr.lock();
+                handle.write_all(&err.data).into_diagnostic()?;
+                handle.flush().into_diagnostic()?;
+            }
+            Some(exec_sandbox_event::Payload::Exit(exit)) => {
+                exit_code = exit.exit_code;
+            }
+            None => {}
+        }
+    }
+
+    Ok(exit_code)
 }
 
 /// Print a single YAML line with dimmed keys and regular values.
@@ -3482,6 +3674,7 @@ pub async fn gateway_inference_set(
     model_id: &str,
     route_name: &str,
     no_verify: bool,
+    timeout_secs: u64,
     tls: &TlsOptions,
 ) -> Result<()> {
     let progress = if std::io::stdout().is_terminal() {
@@ -3505,6 +3698,7 @@ pub async fn gateway_inference_set(
             route_name: route_name.to_string(),
             verify: false,
             no_verify,
+            timeout_secs,
         })
         .await;
 
@@ -3526,6 +3720,7 @@ pub async fn gateway_inference_set(
     println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
     println!("  {} {}", "Model:".dimmed(), configured.model_id);
     println!("  {} {}", "Version:".dimmed(), configured.version);
+    print_timeout(configured.timeout_secs);
     if configured.validation_performed {
         println!("  {}", "Validated Endpoints:".dimmed());
         for endpoint in configured.validated_endpoints {
@@ -3541,11 +3736,12 @@ pub async fn gateway_inference_update(
     model_id: Option<&str>,
     route_name: &str,
     no_verify: bool,
+    timeout_secs: Option<u64>,
     tls: &TlsOptions,
 ) -> Result<()> {
-    if provider_name.is_none() && model_id.is_none() {
+    if provider_name.is_none() && model_id.is_none() && timeout_secs.is_none() {
         return Err(miette::miette!(
-            "at least one of --provider or --model must be specified"
+            "at least one of --provider, --model, or --timeout must be specified"
         ));
     }
 
@@ -3562,6 +3758,7 @@ pub async fn gateway_inference_update(
 
     let provider = provider_name.unwrap_or(&current.provider_name);
     let model = model_id.unwrap_or(&current.model_id);
+    let timeout = timeout_secs.unwrap_or(current.timeout_secs);
 
     let progress = if std::io::stdout().is_terminal() {
         let spinner = ProgressBar::new_spinner();
@@ -3583,6 +3780,7 @@ pub async fn gateway_inference_update(
             route_name: route_name.to_string(),
             verify: false,
             no_verify,
+            timeout_secs: timeout,
         })
         .await;
 
@@ -3604,6 +3802,7 @@ pub async fn gateway_inference_update(
     println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
     println!("  {} {}", "Model:".dimmed(), configured.model_id);
     println!("  {} {}", "Version:".dimmed(), configured.version);
+    print_timeout(configured.timeout_secs);
     if configured.validation_performed {
         println!("  {}", "Validated Endpoints:".dimmed());
         for endpoint in configured.validated_endpoints {
@@ -3640,6 +3839,7 @@ pub async fn gateway_inference_get(
         println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
         println!("  {} {}", "Model:".dimmed(), configured.model_id);
         println!("  {} {}", "Version:".dimmed(), configured.version);
+        print_timeout(configured.timeout_secs);
     } else {
         // Show both routes by default.
         print_inference_route(&mut client, "Gateway inference", "").await;
@@ -3667,6 +3867,7 @@ async fn print_inference_route(
             println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
             println!("  {} {}", "Model:".dimmed(), configured.model_id);
             println!("  {} {}", "Version:".dimmed(), configured.version);
+            print_timeout(configured.timeout_secs);
         }
         Err(e) if e.code() == Code::NotFound => {
             println!("{}", format!("{label}:").cyan().bold());
@@ -3678,6 +3879,14 @@ async fn print_inference_route(
             println!();
             println!("  {} {}", "Error:".red(), e.message());
         }
+    }
+}
+
+fn print_timeout(timeout_secs: u64) {
+    if timeout_secs == 0 {
+        println!("  {} {}s (default)", "Timeout:".dimmed(), 60);
+    } else {
+        println!("  {} {}s", "Timeout:".dimmed(), timeout_secs);
     }
 }
 
@@ -4989,15 +5198,16 @@ fn format_timestamp_ms(ms: i64) -> String {
 mod tests {
     use super::{
         GatewayControlTarget, TlsOptions, format_gateway_select_header,
-        format_gateway_select_items, gateway_auth_label, gateway_select_with, gateway_type_label,
-        git_sync_files, http_health_check, image_requests_gpu, inferred_provider_type,
-        parse_cli_setting_value, parse_credential_pairs, provisioning_timeout_message,
-        ready_false_condition_message, resolve_gateway_control_target_from, sandbox_should_persist,
-        shell_escape, source_requests_gpu, validate_gateway_name, validate_ssh_host,
+        format_gateway_select_items, gateway_add, gateway_auth_label, gateway_select_with,
+        gateway_type_label, git_sync_files, http_health_check, image_requests_gpu,
+        inferred_provider_type, parse_cli_setting_value, parse_credential_pairs,
+        plaintext_gateway_is_remote, provisioning_timeout_message, ready_false_condition_message,
+        resolve_gateway_control_target_from, sandbox_should_persist, shell_escape,
+        source_requests_gpu, validate_gateway_name, validate_ssh_host,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
-    use openshell_bootstrap::{load_active_gateway, store_gateway_metadata};
+    use openshell_bootstrap::{load_active_gateway, load_gateway_metadata, store_gateway_metadata};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -5467,7 +5677,7 @@ mod tests {
         assert_eq!(gateway_type_label(&gateways[0]), "cloud");
         assert_eq!(gateway_type_label(&gateways[1]), "local");
         assert_eq!(gateway_auth_label(&gateways[0]), "cloudflare_jwt");
-        assert_eq!(gateway_auth_label(&gateways[1]), "unknown");
+        assert_eq!(gateway_auth_label(&gateways[1]), "plaintext");
         assert!(header.contains("NAME"));
         assert!(header.contains("ENDPOINT"));
         assert!(header.contains("TYPE"));
@@ -5477,8 +5687,102 @@ mod tests {
         assert!(items[0].contains("cloud"));
         assert!(items[0].contains("cloudflare_jwt"));
         assert!(items[1].contains("local"));
-        assert!(items[1].contains("unknown"));
+        assert!(items[1].contains("plaintext"));
         assert!(items[1].contains("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn gateway_auth_label_defaults_https_gateways_to_mtls() {
+        let gateway = GatewayMetadata {
+            name: "local".to_string(),
+            gateway_endpoint: "https://127.0.0.1:8080".to_string(),
+            is_remote: false,
+            gateway_port: 8080,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: None,
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+
+        assert_eq!(gateway_auth_label(&gateway), "mtls");
+    }
+
+    #[test]
+    fn plaintext_gateway_locality_infers_loopback_endpoints_as_local() {
+        assert!(!plaintext_gateway_is_remote(
+            "http://127.0.0.1:8080",
+            None,
+            false,
+        ));
+        assert!(!plaintext_gateway_is_remote(
+            "http://localhost:8080",
+            None,
+            false,
+        ));
+        assert!(!plaintext_gateway_is_remote(
+            "http://[::1]:8080",
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn plaintext_gateway_locality_treats_non_loopback_endpoints_as_remote_without_local_flag() {
+        assert!(plaintext_gateway_is_remote(
+            "http://gateway.example.com:8080",
+            None,
+            false,
+        ));
+        assert!(plaintext_gateway_is_remote(
+            "http://10.0.0.5:8080",
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn gateway_add_registers_plaintext_loopback_gateway_without_local_flag() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg(tmpdir.path(), || {
+            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+            runtime.block_on(async {
+                gateway_add("http://127.0.0.1:8080", None, None, None, false)
+                    .await
+                    .expect("register plaintext gateway");
+            });
+
+            let metadata = load_gateway_metadata("127.0.0.1").expect("load stored gateway");
+            assert_eq!(metadata.auth_mode.as_deref(), Some("plaintext"));
+            assert!(!metadata.is_remote);
+            assert_eq!(metadata.gateway_endpoint, "http://127.0.0.1:8080");
+            assert_eq!(load_active_gateway().as_deref(), Some("127.0.0.1"));
+        });
+    }
+
+    #[test]
+    fn gateway_add_respects_local_flag_for_plaintext_registrations() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg(tmpdir.path(), || {
+            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+            runtime.block_on(async {
+                gateway_add(
+                    "http://gateway.example.com:8080",
+                    Some("dev-http"),
+                    None,
+                    None,
+                    true,
+                )
+                .await
+                .expect("register plaintext gateway");
+            });
+
+            let metadata = load_gateway_metadata("dev-http").expect("load stored gateway");
+            assert_eq!(metadata.auth_mode.as_deref(), Some("plaintext"));
+            assert!(!metadata.is_remote);
+            assert_eq!(metadata.gateway_endpoint, "http://gateway.example.com:8080");
+            assert_eq!(load_active_gateway().as_deref(), Some("dev-http"));
+        });
     }
 
     #[tokio::test]
